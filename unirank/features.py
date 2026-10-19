@@ -37,12 +37,14 @@ class FeatureMap(object):
         self.group_id = None
         self.default_emb_dim = None
 
+    # 从 JSON 加载特征定义，应用配置中的筛选和覆盖，并建立列索引
     def load(self, json_file, params):
         logging.info("Load feature_map from json: " + json_file)
         with io.open(json_file, "r", encoding="utf-8") as fd:
             feature_map = json.load(fd) #, object_pairs_hook=OrderedDict
         if feature_map["dataset_id"] != self.dataset_id:
             raise RuntimeError("dataset_id={} does not match feature_map!".format(self.dataset_id))
+        
         self.labels = feature_map.get("labels", [])
         self.total_features = feature_map.get("total_features", 0)
         self.input_length = feature_map.get("input_length", 0)
@@ -50,12 +52,14 @@ class FeatureMap(object):
         self.default_emb_dim = params.get("embedding_dim", None)
         self.features = OrderedDict((k, v) for x in feature_map["features"] for k, v in x.items())
         self.num_fields = self.get_num_fields()
+
         if params.get("use_features", None):
             self.features = OrderedDict((x, self.features[x]) for x in params["use_features"])
         if params.get("feature_specs", None):
             self.update_feature_specs(params["feature_specs"])
         self.set_column_index()
 
+    # 修改特征定义的属性值，支持批量修改
     def update_feature_specs(self, feature_specs):
         for col in feature_specs:
             namelist = col["name"]
@@ -66,6 +70,7 @@ class FeatureMap(object):
                     if k != "name":
                         self.features[name][k] = v
 
+    # 将特征定义保存为 JSON 文件
     def save(self, json_file):
         logging.info("Save feature_map to json: " + json_file)
         os.makedirs(os.path.dirname(json_file), exist_ok=True)
@@ -79,6 +84,7 @@ class FeatureMap(object):
         with open(json_file, "w") as fd:
             json.dump(feature_map, fd, indent=4)
 
+    # 统计非 meta 字段数量，也可按 source 筛选
     def get_num_fields(self, feature_source=[]):
         if type(feature_source) != list:
             feature_source = [feature_source]
@@ -90,6 +96,7 @@ class FeatureMap(object):
                 num_fields += 1
         return num_fields
 
+    # 统计字段输出向量拼接后的总维度
     def sum_emb_out_dim(self, feature_source=[]):
         if type(feature_source) != list:
             feature_source = [feature_source]
@@ -103,6 +110,7 @@ class FeatureMap(object):
                                                                self.default_emb_dim))
         return total_dim
 
+    # 建立字段和标签的列索引，支持多维特征
     def set_column_index(self):
         logging.info("Set column index...")
         idx = 0
@@ -119,6 +127,7 @@ class FeatureMap(object):
             self.column_index[label] = idx
             idx += 1
 
+    # 获取字段或标签的列索引，返回单个索引或索引列表
     def get_column_index(self, feature):
         if feature not in self.column_index:
             self.set_column_index()

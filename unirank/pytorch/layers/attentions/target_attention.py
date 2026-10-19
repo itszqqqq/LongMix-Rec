@@ -41,11 +41,13 @@ class MultiHeadTargetAttention(nn.Module):
         self.head_dim = attention_dim // num_heads
         self.scale = self.head_dim ** 0.5 if use_scale else None
         self.use_qkvo = use_qkvo
+
         if use_qkvo:
             self.W_q = nn.Linear(input_dim, attention_dim, bias=False)
             self.W_k = nn.Linear(input_dim, attention_dim, bias=False)
             self.W_v = nn.Linear(input_dim, attention_dim, bias=False)
             self.W_o = nn.Linear(attention_dim, input_dim, bias=False)
+            
         self.dot_attention = ScaledDotProductAttention(
             dropout_rate=dropout_rate,
             attention_activation_type=attention_activation_type,
@@ -77,6 +79,8 @@ class MultiHeadTargetAttention(nn.Module):
         output, _ = self.dot_attention(query, key, value, scale=self.scale, mask=mask)
         # concat heads
         output = output.transpose(1, 2).contiguous().view(-1, self.num_heads * self.head_dim)
+
         if self.use_qkvo:
             output = self.W_o(output)
+        
         return output

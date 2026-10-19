@@ -3,3 +3,24 @@ __pycache__/
 *.py[cod]
 *.model
 checkpoints/
+
+# Python environment and caches
+.venv/
+.cache/
+
+# Downloaded and processed datasets
+/data/KuaiRand/KuaiRand-*/
+/data/KuaiRand_Video_Action*/
+*.tar.gz
+*.zip
+*.parquet
+
+# Training outputs
+*.pt
+*.pth
+*.ckpt
+logs/
+
+# Local credentials
+.env
+.env.*

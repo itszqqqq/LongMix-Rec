@@ -24,7 +24,7 @@ class PerTokenFeedForward(nn.Module):
                  expand=2,
                  net_dropout=0.0):
         super(PerTokenFeedForward, self).__init__()
-        self.input_dim = input_dim
+        self.input_dim = input_dim    
         self.num_token = num_token
         self.hidden_dim = expand * input_dim
         self.W1 = nn.Parameter(torch.empty(self.num_token, self.input_dim, self.hidden_dim))
@@ -36,13 +36,17 @@ class PerTokenFeedForward(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self):
-        nn.init.xavier_uniform_(self.W1)
-        nn.init.xavier_uniform_(self.W2)
+        # nn.init.xavier_uniform_(self.W1)
+        # nn.init.xavier_uniform_(self.W2)
+
+        for t in range(self.num_token):
+            nn.init.xavier_uniform_(self.W1[t])  
+            nn.init.xavier_uniform_(self.W2[t])  
         nn.init.zeros_(self.b1)
         nn.init.zeros_(self.b2)
 
     def forward(self, x: torch.Tensor):  # x: [B, T, D]
-        h = torch.einsum("btd,tdk->btk", x, self.W1) + self.b1
+        h = torch.einsum("btd,tdk->btk", x, self.W1) + self.b1   
         h = self.act(h)
         h = self.dropout(h)
         y = torch.einsum("btk,tkd->btd", h, self.W2) + self.b2
@@ -81,6 +85,7 @@ class PerTokenSwiGLU(nn.Module):
         h2 = torch.einsum("btd,tdk->btk", x, self.W2) + self.b2
         y = torch.einsum("btk,tkd->btd", h1 * h2, self.W3)
         return y
+    
 
 class SwiGLU(nn.Module):
     def __init__(self, input_dim, expand=4, net_dropout=0.0):

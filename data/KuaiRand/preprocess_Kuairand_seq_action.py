@@ -58,8 +58,8 @@ import pyarrow.parquet as pq
 MIN_FEAT_COUNT = 2
 
 LOG_FILES = [
-    "log_random_4_22_to_5_08_27k.csv",
-    "log_standard_4_08_to_4_21_27k_part1.csv",
+    "log_random_4_22_to_5_08_27k.csv",  # 随机曝光日志
+    "log_standard_4_08_to_4_21_27k_part1.csv",   # 标准推荐日志
     "log_standard_4_08_to_4_21_27k_part2.csv",
     "log_standard_4_22_to_5_08_27k_part1.csv",
     "log_standard_4_22_to_5_08_27k_part2.csv",
@@ -94,10 +94,13 @@ USER_STATIC_FEATURES = [
     "is_video_author", "follow_user_num_range", "fans_user_num_range",
     "friend_user_num_range", "register_days_range",
 ] + [f"onehot_feat{i}" for i in range(18)]
+# user_features_27k.csv: 26个用户画像字段
 
 CONTEXT_FEATURES = ["tab", "day_of_week", "is_weekend", "hour"]
 
 ITEM_STATIC_FEATURES = ["video_type", "primary_tag", "music_type", "duration_bucket"]
+# video_features_basic_27k.csv: 视频类型，首个标签，音乐类型、视频时长
+# video_features_statistic_27k.csv: 不读取
 
 FINAL_COLUMNS = (
     ["user_index", "item_index", "seq_len", "user_id"]
@@ -111,30 +114,37 @@ FINAL_COLUMNS = (
 
 def build_ordered_vocab(values, start=1):
     """Construct vocab from iterable object, 0 is reserved for padding/unknown when start=1."""
-    uniq = list(dict.fromkeys(str(v) for v in values))
+    uniq = list(dict.fromkeys(str(v) for v in values))  # 把每个值统一转换成字符串; 去掉重复值, 保留首次出现的顺序。
     return {v: i for i, v in enumerate(uniq, start=start)}
 
 
-PLAY_TIME_BINS = [-1, 0, 1000, 3000, 7000, 18000, 60000, float("inf")]
-PLAY_TIME_LABELS = ["0", "0-1s", "1-3s", "3-7s", "7-18s", "18-60s", "60s+"]
+PLAY_TIME_BINS = [-1, 0, 1000, 3000, 7000, 18000, 60000, float("inf")]     # 播放时长区间（毫秒）
+PLAY_TIME_LABELS = ["0", "0-1s", "1-3s", "3-7s", "7-18s", "18-60s", "60s+"]  # 播放标签
 
-DURATION_BINS = [-1, 0, 3000, 7000, 15000, 30000, 60000, float("inf")]
-DURATION_LABELS = ["0", "0-3s", "3-7s", "7-15s", "15-30s", "30-60s", "60s+"]
+DURATION_BINS = [-1, 0, 3000, 7000, 15000, 30000, 60000, float("inf")]   # 视频时长区间（毫秒）
+DURATION_LABELS = ["0", "0-3s", "3-7s", "7-15s", "15-30s", "30-60s", "60s+"]  # 视频标签
 
 
 def bucket_play_time(s: pd.Series) -> pd.Series:
-    return pd.cut(s.fillna(0), bins=PLAY_TIME_BINS, labels=PLAY_TIME_LABELS).astype(str)
-
+    # 按用户播放时长分桶
+    return pd.cut(s.fillna(0), bins=PLAY_TIME_BINS, labels=PLAY_TIME_LABELS).astype(str)  # pd.cut() 默认使用左开右闭区间
+    # s = pd.Series([0, 1000, 1001, 3000, None])
+    # bucket_play_time(s) -> ["0", "0-1s", "1-3s", "1-3s", "0"]
 
 def bucket_duration(s: pd.Series) -> pd.Series:
+    # 按视频时长分桶
     return pd.cut(s.fillna(0), bins=DURATION_BINS, labels=DURATION_LABELS).astype(str)
 
-
 def fmt_date_int(d: int) -> str:
+    # 整数日期变成可读字符串
     return f"{d // 10000}-{(d % 10000) // 100:02d}-{d % 100:02d}"
 
 
 def build_date_split(sorted_dates, train_ratio, valid_ratio, test_ratio):
+    '''
+    根据时间顺序，确定哪些日期用于训练、验证和测试。 
+    返回日期列表及切分边界，实际的样本行切分由后面的 process_partition() 完成
+    '''
     n_days = len(sorted_dates)
     if n_days < 3:
         raise ValueError(
@@ -187,7 +197,7 @@ def build_date_split(sorted_dates, train_ratio, valid_ratio, test_ratio):
 # ================================================================
 
 def load_user_features(data_dir: Path) -> pd.DataFrame:
-    """Loading user features (27K lines, small)."""
+    """Loading user features (27K lines, small). 读取并清理用户画像"""
     fp = data_dir / "user_features_27k.csv"
     print(f"  [Load] {fp.name}")
     cols = ["user_id"] + USER_STATIC_FEATURES
@@ -204,9 +214,13 @@ def build_all_vocabs(uf: pd.DataFrame) -> dict:
     Note: Only static vocab is built here, and filtering based on frequency is not performed.
     OOV filtering is done in build_vocabs_with_oov_filter."""
     vocabs = {}
+    # 参数 uf 是用户画像表，一行一个用户。函数逐个处理 USER_STATIC_FEATURES 中的字段
     for col in USER_STATIC_FEATURES:
-        vals = sorted(set(uf[col].unique()) | {"__MISSING__"})
-        vocabs[col] = {v: i + 1 for i, v in enumerate(vals)}
+        vals = sorted(set(uf[col].unique()) | {"__MISSING__"})  # 取出该列所有唯一值转换为集合，并加入 __MISSING__ 作为缺失值占位符
+        vocabs[col] = {v: i + 1 for i, v in enumerate(vals)}    # 将类别映射为从 1 开始的整数，0 暂不分配
+    # 如 vocabs[col] = {"A": 1, "B": 2, "C": 3, "__MISSING__": 4}
+    
+    # 为上下文字段建立固定词表
     vocabs["tab"] = {str(i): i + 1 for i in range(15)}
     vocabs["day_of_week"] = {str(i): i + 1 for i in range(7)}
     vocabs["is_weekend"] = {"0": 1, "1": 2}
@@ -221,7 +235,7 @@ def build_vocabs_with_oov_filter(
     min_feat_count: int = MIN_FEAT_COUNT,
 ) -> dict:
     """Build a vocab based on frequency statistics and filter feature values occurring fewer than min_feat_count times.
-
+    根据交互频次，过滤画像类别并重新编号
     Args:
         uf: User Features DataFrame (USER_STATIC_FEATURES is in string form)
         feat_value_counters: {feature_name: {value_int: count}}
@@ -280,6 +294,7 @@ def build_item_vocabs_with_oov_filter(
     min_feat_count: int = MIN_FEAT_COUNT,
 ) -> dict:
     """Construct item feature vocab to filter low-frequency values based on frequency.
+    为每个视频属性建立词表，并排除部分低频取值
 
     Args:
         item_feat_df: item feature DataFrame (cleaned to str)
@@ -311,7 +326,8 @@ def build_item_vocabs_with_oov_filter(
 
 
 def build_action_maps():
-    """Enumerate all 2^6=64 action patterns → (pattern_int→name, name→code)."""
+    """Enumerate all 2^6=64 action patterns → (pattern_int→name, name→code).
+    把六个反馈标签组合成一个行为类别"""
     pat2name = {}
     for p in range(64):
         if p == 0:
@@ -319,12 +335,15 @@ def build_action_maps():
         else:
             parts = [c for i, c in enumerate(LABEL_COLUMNS) if p & (1 << i)]
             pat2name[p] = "|".join(parts)
+            # 如 pat2name[3] = "is_click|is_like"
+    # 将这些名称排序，再分配 1～64 的行为编号，保留编号 0 给 padding 等用途
     name2code = {n: i + 1 for i, n in enumerate(sorted(set(pat2name.values())))}
     return pat2name, name2code
 
 
 def encode_user_features_to_int(uf: pd.DataFrame, vocabs: dict) -> pd.DataFrame:
-    """Precode user features into int16, which greatly saves memory when merging into logs."""
+    """Precode user features into int16, which greatly saves memory when merging into logs.
+    根据每个用户属性的词表，把属性值转换成整数编号，返回一张新的用户特征表"""
     uf_enc = uf[["user_id"]].copy()
     for col in USER_STATIC_FEATURES:
         uf_enc[col] = uf[col].map(vocabs[col]).fillna(0).astype("int16")
@@ -346,6 +365,8 @@ def _preprocess_chunk(
       2. Extract the date column (int32, YYYYMMDD) for segmentation by date
       3. play_time bucketing + context feature encoding → int8
       4. Merge precoded user features → int16
+    _preprocess_chunk() 没有这条 merge 操作，也没有使用 uf_enc 的语句。所以它只处理日志中的时间、播放时长、上下文字段，返回的表里不会因此出现用户画像列
+    注释写了“合并用户特征”，但这个操作实际发生在后面的函数中。画像合并安排在 Phase 2 的 process_partition()。
 
     Note: This function is shared between Phase 1 and Phase 2. When Phase 1 is called
     vocabs may be an empty dictionary (in this case, str feature values will be retained first), in Phase 2
@@ -355,25 +376,26 @@ def _preprocess_chunk(
     Don't do USER_STATIC_FEATURES encoding (because ultimately vocab depends on OOV filtering).
     """
     # ---- Timestamp decomposition ----
-    dt = pd.to_datetime(chunk["time_ms"], unit="ms", utc=True).dt.tz_convert(
-        "Asia/Shanghai"
-    )
-    chunk["day_of_week"] = dt.dt.dayofweek.astype("int8")
-    chunk["is_weekend"] = (dt.dt.dayofweek >= 5).astype("int8")
-    chunk["hour"] = dt.dt.hour.astype("int8")
+    dt = pd.to_datetime(chunk["time_ms"], unit="ms", utc=True).dt.tz_convert("Asia/Shanghai")  # 将时间戳转换为北京时间
+    # 提取星期、周末标识、小时和日期
+    chunk["day_of_week"] = dt.dt.dayofweek.astype("int8")  # 0=Monday, 6=Sunday
+    chunk["is_weekend"] = (dt.dt.dayofweek >= 5).astype("int8")  # 0=weekday, 1=weekend
+    chunk["hour"] = dt.dt.hour.astype("int8")  # 0-23
 
     # ---- Extract date column (YYYYMMDD int32) ----
-    chunk["date"] = (dt.dt.year * 10000 + dt.dt.month * 100 + dt.dt.day).astype("int32")
+    chunk["date"] = (dt.dt.year * 10000 + dt.dt.month * 100 + dt.dt.day).astype("int32")  # 整数日期用于后续划分训练、验证、测试集
     del dt
 
     # ---- play_time bucketing + encoding ----
-    pt_bucket_str = bucket_play_time(chunk["play_time_ms"])
+    # 将实际播放时长分桶并编码
+    pt_bucket_str = bucket_play_time(chunk["play_time_ms"])  # 先把毫秒数转换成区间名称
     chunk["play_time_bucket"] = (
         pt_bucket_str.map(vocabs["play_time_bucket"]).fillna(0).astype("int8")
     )
     del pt_bucket_str
 
     # ---- Context feature encoding ----
+    # 将上下文属性映射为类别编号
     chunk["tab"] = (
         chunk["tab"].astype(str).map(vocabs["tab"]).fillna(0).astype("int8")
     )
@@ -388,22 +410,24 @@ def _preprocess_chunk(
     )
 
     # ---- Discard columns no longer needed ----
+    # 已经生成了 play_time_bucket，这里删除原始播放时长列。inplace=True 表示直接修改当前 chunk
     chunk.drop(columns=["play_time_ms"], inplace=True)
 
     # ---- Remove missing ID rows ----
+    # 如果一条记录的用户 ID 或视频 ID 缺失，就删除整条记录，因为后续无法可靠地关联用户、视频信息
     chunk.dropna(subset=["user_id", "video_id"], inplace=True)
 
     return chunk
 
 
 def phase1_partition_to_parquet(
-    data_dir: Path,
-    tmp_dir: Path,
-    uf_enc: pd.DataFrame,
-    vocabs: dict,
-    n_parts: int,
-    chunk_size: int,
-    buffer_flush_size: int,
+    data_dir: Path,   # 原始 CSV 日志所在目录
+    tmp_dir: Path,    # 临时分区 Parquet 的存放目录
+    uf_enc: pd.DataFrame,   # 预编码的用户画像表
+    vocabs: dict,   # 初始词表
+    n_parts: int,   # 用户分区数量
+    chunk_size: int,   # 每次读取 CSV 的行数
+    buffer_flush_size: int,  # 当缓冲区累计的行数达到这个阈值时，就将缓冲区内容写入 Parquet 文件
 ):
     """
     Read CSV file-by-file and chunk-by-chunk → preprocess → write to Parquet partitioned by user_id hash.
@@ -411,6 +435,9 @@ def phase1_partition_to_parquet(
       - user_counts / item_ids / all_dates
       - feat_value_counters: {feature_name: {value_int: count}}
         Used for subsequent OOV low-frequency feature filtering
+    分批读取原始日志，处理每批记录，再按用户 ID 分区保存成临时 Parquet, 同时统计用户交互次数、出现过的视频 ID 和日期
+    （同一个用户无论出现在什么 CSV、什么读取批次中，都会进入同一个分区。后续才能在一个分区内收集这个用户的完整交互，并按时间整理历史。
+      一个分区可以包含多个用户，包含多个 parquet 文件）
 
     Note: To support OOV filtering, Phase 1 does not do the final encoding of USER_STATIC_FEATURES here.
     Instead, it only does temporal/contextual feature encoding and retains the user_id for subsequent merges.
@@ -420,7 +447,7 @@ def phase1_partition_to_parquet(
     for p in range(n_parts):
         (tmp_dir / f"part_{p:03d}").mkdir(exist_ok=True)
 
-    user_counts = defaultdict(int)
+    user_counts = defaultdict(int)  # 保存每个用户累计出现的次数
     item_ids = set()
     all_dates = set()
 
@@ -430,13 +457,14 @@ def phase1_partition_to_parquet(
     # Here is changed to: After Phase 1 is completed, use user_counts and uf_enc to jointly calculate
     feat_value_counters = None  # Placeholder, will be filled in the main process
 
-    buffers = {p: [] for p in range(n_parts)}
-    buf_sizes = {p: 0 for p in range(n_parts)}
-    file_counts = {p: 0 for p in range(n_parts)}
+    buffers = {p: [] for p in range(n_parts)}    # 存储每个分区的缓冲区数据块
+    buf_sizes = {p: 0 for p in range(n_parts)}   # 存储每个分区缓冲区的累计行数
+    file_counts = {p: 0 for p in range(n_parts)}  # 记录每个分区已经写入的 Parquet 文件数量
 
     def flush(pid):
         if not buffers[pid]:
             return
+        # 将列表中的多张 DataFrame (chunk)按行拼接成一张表，ignore_index=True 会重新生成连续索引
         out = pd.concat(buffers[pid], ignore_index=True)
         fp = tmp_dir / f"part_{pid:03d}" / f"c_{file_counts[pid]:04d}.parquet"
         out.to_parquet(fp, index=False, engine="pyarrow")
@@ -445,6 +473,7 @@ def phase1_partition_to_parquet(
         buf_sizes[pid] = 0
         del out
 
+    # 逐个 CSV、逐个 chunk 地读取日志
     total_rows = 0
     for fname in LOG_FILES:
         print(f"  [Phase1] {fname}")
@@ -457,13 +486,14 @@ def phase1_partition_to_parquet(
         for chunk in reader:
             chunk = _preprocess_chunk(chunk, uf_enc, vocabs)
 
-            vc = chunk["user_id"].value_counts(sort=False)
+            vc = chunk["user_id"].value_counts(sort=False)  # 统计当前 chunk 中每个用户出现多少次
             for uid, cnt in zip(vc.index, vc.values):
                 user_counts[uid] += int(cnt)
+            # 更新视频和日期集合
             item_ids.update(chunk["video_id"].unique().tolist())
             all_dates.update(chunk["date"].unique().tolist())
 
-            part_arr = chunk["user_id"].values.astype(np.int64) % n_parts
+            part_arr = chunk["user_id"].values.astype(np.int64) % n_parts   # 分区编号 = 用户 ID 对分区数量取余
             for pid in range(n_parts):
                 mask = part_arr == pid
                 n_match = int(mask.sum())
@@ -473,6 +503,7 @@ def phase1_partition_to_parquet(
                     if buf_sizes[pid] >= buffer_flush_size:
                         flush(pid)
 
+            # 一个 chunk 处理结束后，更新总行数并清理临时变量
             total_rows += len(chunk)
             del chunk, part_arr
             gc.collect()
@@ -495,7 +526,7 @@ def compute_feat_value_counters(
     uf_enc: pd.DataFrame,
 ) -> dict:
     """Calculate the frequency of feature values for USER_STATIC_FEATURES based on user_counts and uf_enc.
-
+    统计每个用户静态属性的取值，在交互日志中累计出现了多少次，供后续 OOV 过滤使用
     The number of times each user appears in the log × user feature value = the total number of occurrences of the feature value in the log.
 
     Args:
@@ -517,7 +548,7 @@ def compute_feat_value_counters(
 
     for col in USER_STATIC_FEATURES:
         # Aggregate count by feature value
-        grouped = uc_df.groupby(col)["count"].sum()
+        grouped = uc_df.groupby(col)["count"].sum()  # 将属性编号相同的用户放在一组，累加这一组用户的交互次数。
         for v, cnt in grouped.items():
             counters[col][int(v)] += int(cnt)
 
@@ -528,18 +559,19 @@ def compute_feat_value_counters(
 # ================================================================
 #  5. Phase 2: Per-partition Process + Incremental Write
 # ================================================================
+# 把 Phase 1 中按用户分区保存的临时日志，整理成“逐条预测样本＋用户完整历史轨迹”，然后按日期切分，并交给后续写入流程
 
 def process_partition(
-    tmp_dir: Path,
-    pid: int,
-    valid_users: set,
-    user_idx_map: dict,
-    item_idx_map: dict,
-    uf_enc: pd.DataFrame,
-    vocabs: dict,
-    pat2name: dict,
+    tmp_dir: Path,   # Phase 1 临时目录
+    pid: int,   # 要处理的分区编号
+    valid_users: set,  # 通过最低交互次数过滤的用户集合 
+    user_idx_map: dict,  # 原始用户 ID → 全局用户索引
+    item_idx_map: dict,  # 原始视频 ID → 全局视频索引
+    uf_enc: pd.DataFrame,  # 用户画像的中间整数编码表
+    vocabs: dict,   # 过滤后的用户属性词表，中间编号 → 最终编号
+    pat2name: dict,    # 六个反馈标签的组合编码映射
     name2code: dict,
-    valid_start_date: int,
+    valid_start_date: int,   # 验证集、测试集的起始日期
     test_start_date: int,
 ):
     """
@@ -555,33 +587,33 @@ def process_partition(
     Returns dict{train, valid, test, user_info} or None.
     """
     part_dir = tmp_dir / f"part_{pid:03d}"
-    files = sorted(part_dir.glob("*.parquet"))
+    files = sorted(part_dir.glob("*.parquet"))  # 获取分区目录下的所有 parquet 文件
     if not files:
         return None
 
     dfs = []
     for f in files:
         d = pd.read_parquet(f)
-        d = d[d["user_id"].isin(valid_users)]
+        d = d[d["user_id"].isin(valid_users)]  # 只保留有效用户
         if len(d) > 0:
             dfs.append(d)
         del d
     if not dfs:
         return None
 
-    df = pd.concat(dfs, ignore_index=True)
+    df = pd.concat(dfs, ignore_index=True)  # 合并所有 parquet 文件的内容，ignore_index=True 表示重新生成连续索引
     del dfs
     gc.collect()
 
     # ---- Merge precoded user features (int16) ----
-    df = df.merge(uf_enc, on="user_id", how="left")
+    df = df.merge(uf_enc, on="user_id", how="left")    # 合并用户画像
     for col in USER_STATIC_FEATURES:
         df[col] = df[col].fillna(0).astype("int16")
         # Apply OOV filtering: values not in vocab are mapped to 0
         df[col] = df[col].map(vocabs[col]).fillna(0).astype("int32")
 
     # ---- Sort: by time within user ----
-    df.sort_values(["user_id", "time_ms"], inplace=True)
+    df.sort_values(["user_id", "time_ms"], inplace=True)  # 将同一用户的记录放到一起，再按该用户的交互时间排列
     df.reset_index(drop=True, inplace=True)
 
     # ---- Encoding ID ----
@@ -593,21 +625,22 @@ def process_partition(
             f"partition={pid} There is video_id: {bad_video_ids} that has not entered the global item mapping"
         )
     df["item_index"] = global_item_index.astype(np.int32)
-    df["user_id"] = (df["user_index"] + 1).astype(np.int32)
+    df["user_id"] = (df["user_index"] + 1).astype(np.int32)  # user_id 被覆盖为模型使用的用户类别编号，不再是原始用户 ID
 
     # ---- label → float32 ----
     for col in LABEL_COLUMNS:
-        df[col] = df[col].astype(np.float32)
+        df[col] = df[col].astype(np.float32)  # 六个预测标签转换成浮点数，便于后续损失计算
 
     # ---- exposure + action ----
-    binary = df[LABEL_COLUMNS].values.astype(np.int8)
-    df["exposure"] = (binary.sum(axis=1) == 0).astype(np.float32)
+    binary = df[LABEL_COLUMNS].values.astype(np.int8)  # 六个标签的二进制矩阵，行数 = 样本数，列数 = 6
+    df["exposure"] = (binary.sum(axis=1) == 0).astype(np.float32)  # 如果六个标签全为 0，则 exposure=1，否则 exposure=0
+
     pattern = np.zeros(len(df), dtype=np.int32)
     for i in range(len(LABEL_COLUMNS)):
-        pattern += binary[:, i].astype(np.int32) << i
+        pattern += binary[:, i].astype(np.int32) << i   # << i 是左移运算，这里相当于乘以 2**i
     df["action"] = (
         pd.Series(pattern, index=df.index).map(pat2name).map(name2code).astype(np.int32)
-    )
+    )  # 反馈组合整数 → 行为名称 → 最终 action 编号
     del binary, pattern
 
     # ---- Characteristic conversion to int32 ----
@@ -615,10 +648,10 @@ def process_partition(
         df[col] = df[col].astype(np.int32)
 
     # ---- time_ms ensures int64 ----
-    df["time_ms"] = pd.to_numeric(df["time_ms"], errors="coerce").fillna(0).astype(np.int64)
+    df["time_ms"] = pd.to_numeric(df["time_ms"], errors="coerce").fillna(0).astype(np.int64)  # 确保时间戳是 int64 类型，避免后续排序或计算时出现溢出或精度问题
 
     # ---- seq_len ----
-    df["seq_len"] = df.groupby("user_index", sort=False).cumcount().astype(np.int32)
+    df["seq_len"] = df.groupby("user_index", sort=False).cumcount().astype(np.int32)   # 给每个用户的交互记录按时间顺序编号，编号从 0 开始，表示该用户的历史交互长度
 
     # ---- Build user_info ----
     user_info_rows = []
@@ -626,9 +659,9 @@ def process_partition(
         user_info_rows.append(
             {
                 "user_index": int(uidx),
-                "full_item_seq": gdf["item_index"].astype(int).tolist(),
-                "full_action_seq": gdf["action"].astype(int).tolist(),
-                "full_timestamp_seq": gdf["time_ms"].astype(np.int64).tolist(),
+                "full_item_seq": gdf["item_index"].astype(int).tolist(),   # 该用户的完整视频交互序列
+                "full_action_seq": gdf["action"].astype(int).tolist(),   # 该用户的完整行为序列
+                "full_timestamp_seq": gdf["time_ms"].astype(np.int64).tolist(),  # 该用户的完整时间戳序列
             }
         )
 
@@ -638,6 +671,7 @@ def process_partition(
     valid_df = df[(date_col >= valid_start_date) & (date_col < test_start_date)]
     test_df = df[date_col >= test_start_date]
 
+    # 负责选择预测样本最终保存的字段
     def _select_final(sdf):
         if len(sdf) == 0:
             return pd.DataFrame(columns=FINAL_COLUMNS)
@@ -650,6 +684,7 @@ def process_partition(
         "test": _select_final(test_df),
         "user_info": user_info_rows,
     }
+    # 前三项是逐条样本表；最后一项是一行一个用户的完整轨迹信息
 
     del df, train_df, valid_df, test_df
     gc.collect()
@@ -657,7 +692,6 @@ def process_partition(
 
 
 _PHASE2_WORKER_STATE = {}
-
 
 def _init_phase2_worker(
     tmp_dir,
@@ -690,7 +724,8 @@ def _init_phase2_worker(
 
 
 def _process_partition_to_temp(pid: int):
-    """Process individual user partitions in parallel and write large results to temporary Parquet."""
+    """Process individual user partitions in parallel and write large results to temporary Parquet.
+    多进程处理的辅助函数：处理指定分区，把结果保存为临时 Parquet，再将文件路径返回给主进程"""
     state = _PHASE2_WORKER_STATE
     result = process_partition(
         state["tmp_dir"],
@@ -708,7 +743,7 @@ def _process_partition_to_temp(pid: int):
     if result is None:
         return {"pid": int(pid), "empty": True}
 
-    part_result_dir = state["result_dir"] / f"part_{pid:03d}"
+    part_result_dir = state["result_dir"] / f"part_{pid:03d}"  # 有数据时，创建该分区的临时结果目录
     if part_result_dir.exists():
         shutil.rmtree(part_result_dir)
     part_result_dir.mkdir(parents=True, exist_ok=True)
@@ -726,13 +761,15 @@ def _process_partition_to_temp(pid: int):
         sdf.to_parquet(split_file, index=False, engine="pyarrow")
         split_files[split_name] = str(split_file)
 
+    # 将文件位置返回给主进程
     payload = {
-        "pid": int(pid),
-        "empty": False,
-        "result_dir": str(part_result_dir),
-        "user_info_file": str(user_info_file),
-        "split_files": split_files,
+        "pid": int(pid),   # 分区编号
+        "empty": False,    # 是否为空分区
+        "result_dir": str(part_result_dir),  # 临时结果目录
+        "user_info_file": str(user_info_file),    # 用户完整轨迹信息的 Parquet 文件
+        "split_files": split_files,  # 逐条样本的 Parquet 文件位置，可能包含 train、valid、test 中的部分或全部
     }
+    # 删除部分大型对象的局部引用，并尝试回收内存，最后返回路径信息
     del result, user_info_rows
     gc.collect()
     return payload
@@ -741,6 +778,8 @@ def _process_partition_to_temp(pid: int):
 # ================================================================
 #  6. Split Block Manager (refer to TAAC2025 implementation)
 # ================================================================
+# 这一部分的核心任务是：将已经划分好的 train、valid、test 数据，分别组织成多个可独立加载的 block，并为每个 block 配齐样本、用户历史和视频属性。
+# 同时，它会建立紧凑的块内索引，让数据加载器能够在当前 block 内查表；用于模型 embedding 的全局特征编号则保持一致。
 
 def safe_int(v, default=0):
     try:
@@ -761,6 +800,7 @@ class SplitBlockManager:
     inside block:
       - user_index / item_index remapped to block-local dense index
       - user_id / item_id maintains the global id and does not affect embedding consistency
+
     """
 
     def __init__(self, split_name: str, root_dir: Path, num_blocks: int):
@@ -776,28 +816,28 @@ class SplitBlockManager:
         self.user_info_dir.mkdir(parents=True, exist_ok=True)
         self.item_info_dir.mkdir(parents=True, exist_ok=True)
 
-        self.data_writers = [None] * self.num_blocks
-        self.user_writers = [None] * self.num_blocks
+        self.data_writers = [None] * self.num_blocks  # 用于写入每个 block 的 ParquetWriter 对象
+        self.user_writers = [None] * self.num_blocks  # 用于写入每个 block 的用户信息 ParquetWriter 对象
 
-        self.block_rows = [0] * self.num_blocks
-        self.block_user_rows = [0] * self.num_blocks
+        self.block_rows = [0] * self.num_blocks   # 记录每个 block 已经写入的样本行数
+        self.block_user_rows = [0] * self.num_blocks   # 记录每个 block 已经写入的用户历史行数
 
-        self.partition_to_block = {}
+        self.partition_to_block = {}  # 记录每个 partition 被分配到了哪个 block
 
-        self.user_maps = [dict() for _ in range(self.num_blocks)]
-        self.item_maps = [{0: 0} for _ in range(self.num_blocks)]
+        self.user_maps = [dict() for _ in range(self.num_blocks)]   # 全局用户索引 → 当前块的本地用户索引，索引从 0 开始
+        self.item_maps = [{0: 0} for _ in range(self.num_blocks)]   # 全局视频索引 → 当前块的本地视频索引，索引从 1 开始，0 → 0 留给 padding
 
-        self.next_user_local = [0] * self.num_blocks
-        self.next_item_local = [1] * self.num_blocks
+        self.next_user_local = [0] * self.num_blocks  # 记录每个 block 下一个可用的本地用户索引
+        self.next_item_local = [1] * self.num_blocks  # 记录每个 block 下一个可用的本地视频索引，1 开始，0 留给 padding
 
     def choose_block(self, n_rows: int) -> int:
-        return int(np.argmin(self.block_rows))
+        return int(np.argmin(self.block_rows))  # 选择当前样本行数最少的block
 
     def _get_or_add_user_local(self, bid: int, global_user_index: int) -> int:
-        mp = self.user_maps[bid]
-        if global_user_index not in mp:
-            mp[global_user_index] = self.next_user_local[bid]
-            self.next_user_local[bid] += 1
+        mp = self.user_maps[bid]   # 全局用户索引 → 当前块的本地用户索引
+        if global_user_index not in mp:  # 如果当前全局用户索引还没有在这个块中出现过，就分配一个新的本地用户索引
+            mp[global_user_index] = self.next_user_local[bid]  # 分配新的本地用户索引
+            self.next_user_local[bid] += 1   # 更新下一个可用的本地用户索引
         return mp[global_user_index]
 
     def _get_or_add_item_local(self, bid: int, global_item_id: int) -> int:
@@ -807,21 +847,24 @@ class SplitBlockManager:
             self.next_item_local[bid] += 1
         return mp[global_item_id]
 
+    # 将当前 DataFrame 追加到指定 block 的文件
     def _write_table(self, writer_list, bid: int, out_fp: Path, df: pd.DataFrame):
         if len(df) == 0:
             return
-        table = pa.Table.from_pandas(df, preserve_index=False)
+        table = pa.Table.from_pandas(df, preserve_index=False)  # 将 DataFrame 转换为 PyArrow Table，preserve_index=False 表示不保留 DataFrame 的索引列
         if writer_list[bid] is None:
-            writer_list[bid] = pq.ParquetWriter(str(out_fp), table.schema)
+            writer_list[bid] = pq.ParquetWriter(str(out_fp), table.schema) # 创建 ParquetWriter 对象，指定输出文件路径和表的 schema，table.schema 描述各列的名称和类型
         writer_list[bid].write_table(table)
 
     def append_partition(
         self,
-        pid: int,
-        split_df: pd.DataFrame,
-        user_info_rows: list,
-    ):
+        pid: int,  # 来源用户 partition 的编号
+        split_df: pd.DataFrame,  # 当前 partition 中属于当前 split 的样本表，包含 user_index、item_index、action、exposure 等列
+        user_info_rows: list,   # 当前 partition 的用户完整轨迹信息，每个元素是一个字典，包含 user_index、full_item_seq、full_action_seq、full_timestamp_seq 等键
+    ): 
         """Append the split data of a partition to a block.
+        把一个 partition 中属于当前 split 的样本，整体追加到一个 block；
+        同时将用户、视频的全局索引转换为块内索引，并写出样本表和用户历史表。
 
         Args:
             pid: partition id
@@ -831,8 +874,8 @@ class SplitBlockManager:
         if len(split_df) == 0:
             return None
 
-        bid = self.choose_block(len(split_df))
-        self.partition_to_block[int(pid)] = int(bid)
+        bid = self.choose_block(len(split_df))   # 选择一个 block 来存放当前 partition 的数据，通常选择当前样本行数最少的 block
+        self.partition_to_block[int(pid)] = int(bid)   # 记录当前 partition 被分配到了哪个 block
 
         # Build a lookup table of user_index -> user_info_row
         ui_lookup = {r["user_index"]: r for r in user_info_rows}
@@ -840,7 +883,7 @@ class SplitBlockManager:
         active_users = pd.unique(split_df["user_index"].astype(np.int64))
         active_users_set = set(active_users.tolist())
 
-        out_ui_rows = []
+        out_ui_rows = []   # 收集转换后的用户历史记录
         for g_user in active_users_set:
             if g_user not in ui_lookup:
                 raise ValueError(
@@ -848,47 +891,48 @@ class SplitBlockManager:
                     f"Does not exist in user_info, logical exception."
                 )
             row = ui_lookup[g_user]
-            l_user = self._get_or_add_user_local(bid, int(g_user))
+            l_user = self._get_or_add_user_local(bid, int(g_user))   # 将全局用户索引转换为当前块的本地用户索引
 
-            g_item_seq = row.get("full_item_seq", [])
+            g_item_seq = row.get("full_item_seq", []) # 获取该用户的完整视频交互序列
             if not isinstance(g_item_seq, (list, tuple, np.ndarray)):
                 g_item_seq = []
             l_item_seq = []
+
             for x in g_item_seq:
-                g_item = safe_int(x, -1)
+                g_item = safe_int(x, -1)  # 将全局视频索引转换为整数，如果无法转换则返回 -1
                 if g_item <= 0:
                     raise ValueError(
                         f"[{self.split_name}] partition={pid} user_index={g_user} "
                         f"The full_item_seq contains the illegal global item_index={g_item}."
                     )
-                l_item_seq.append(self._get_or_add_item_local(bid, g_item))
+                l_item_seq.append(self._get_or_add_item_local(bid, g_item))  # 将全局视频索引转换为当前块的本地视频索引
 
-            g_action_seq = row.get("full_action_seq", [])
+            g_action_seq = row.get("full_action_seq", [])  # 获取该用户的完整行为序列
             if not isinstance(g_action_seq, (list, tuple, np.ndarray)):
                 g_action_seq = []
 
-            g_time_seq = row.get("full_timestamp_seq", [])
+            g_time_seq = row.get("full_timestamp_seq", [])  # 获取该用户的完整时间戳序列
             if not isinstance(g_time_seq, (list, tuple, np.ndarray)):
                 g_time_seq = []
 
             out_ui_rows.append(
                 {
-                    "user_index": np.int32(l_user),
-                    "full_item_seq": [int(x) for x in l_item_seq],
-                    "full_action_seq": [int(x) for x in g_action_seq],
+                    "user_index": np.int32(l_user),  # 当前块的本地用户索引
+                    "full_item_seq": [int(x) for x in l_item_seq],  # 将本地视频索引序列转换为整数列表
+                    "full_action_seq": [int(x) for x in g_action_seq],  
                     "full_timestamp_seq": [int(x) for x in g_time_seq],
                 }
             )
 
-        out_ui_df = pd.DataFrame(out_ui_rows)
+        out_ui_df = pd.DataFrame(out_ui_rows)  
 
-        user_map = self.user_maps[bid]
-        item_map = self.item_maps[bid]
+        user_map = self.user_maps[bid]   # 全局用户索引 → 当前块的本地用户索引
+        item_map = self.item_maps[bid]   # 全局视频索引 → 当前块的本地视频索引
 
         out_df = split_df.copy()
-        out_df["user_index"] = out_df["user_index"].map(user_map).astype(np.int32)
-        local_item_index = out_df["item_index"].map(item_map)
-        if local_item_index.isna().any() or (local_item_index <= 0).any():
+        out_df["user_index"] = out_df["user_index"].map(user_map).astype(np.int32)  # 将全局用户索引转换为当前块的本地用户索引
+        local_item_index = out_df["item_index"].map(item_map)    # 将全局视频索引转换为当前块的本地视频索引
+        if local_item_index.isna().any() or (local_item_index <= 0).any():  # 如果有任何视频索引在当前块中没有映射，或者映射后的本地索引小于等于 0（0 是 padding），则说明当前样本的历史映射不完整
             bad_global_items = (
                 out_df.loc[local_item_index.isna() | (local_item_index <= 0), "item_index"]
                 .drop_duplicates()
@@ -901,8 +945,8 @@ class SplitBlockManager:
             )
         out_df["item_index"] = local_item_index.astype(np.int32)
 
-        data_fp = self.data_dir / f"part-{bid:05d}.parquet"
-        ui_fp = self.user_info_dir / f"part-{bid:05d}.parquet"
+        data_fp = self.data_dir / f"part-{bid:05d}.parquet"   # 当前块的样本表输出路径
+        ui_fp = self.user_info_dir / f"part-{bid:05d}.parquet"   # 当前块的用户历史表输出路径
 
         self._write_table(self.data_writers, bid, data_fp, out_df)
         self._write_table(self.user_writers, bid, ui_fp, out_ui_df)

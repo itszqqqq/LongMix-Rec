@@ -61,6 +61,7 @@ def build_unified_tokenizer(tokenizer_type,
             layer_norm=layer_norm,
         )
         return tokenizer, num_tokens, False
+    
     if tokenizer_type == "Auto":
         tokenizer = AutoSplitTokenizer(
             input_dim=input_dim,

@@ -347,6 +347,7 @@ class UniRankDataloader(DataLoader):
 # BlockedBatchCollator
 # ================================================================
 
+# 从一个 block 的目标行与配对 side info 构建 batch；不能混用不同块的局部 index。
 class BlockedBatchCollator(object):
     """
     blocked version:
@@ -380,6 +381,8 @@ class BlockedBatchCollator(object):
         self.action_task_table = self._build_action_task_table(action_vocab)
         self.side_cache = OrderedDict()
 
+    # action ID 不是 bitmask：按 metadata 中的组合名字拆出任务，得到 [action, task] 查表。
+    # 六反馈组合可以匹配 label_col 的任意顺序；exposure 对所有正反馈任务的值为 0。
     def _build_action_task_table(self, action_vocab):
         max_action_id = max(int(v) for v in action_vocab.values()) if len(action_vocab) > 0 else 0
         action_task_table = np.zeros(
@@ -414,6 +417,8 @@ class BlockedBatchCollator(object):
             self.side_cache[cache_key] = value
             return value
 
+        # 只加载 item/action 完整轨迹；预处理保存的 full_timestamp_seq 在此路径未读入。
+        # 所以保存 timestamp 不等于当前模型已经使用时间差 embedding。
         need_user_cols = ["user_index", "full_item_seq", "full_action_seq"]
         user_df = pd.read_parquet(user_info_file, columns=need_user_cols)
         user_df = user_df.set_index("user_index").sort_index()
@@ -522,6 +527,7 @@ class BlockedBatchCollator(object):
             raise IndexError(f"user_index={bad_uid} does not exist in blocked user_info. file={user_info_file}")
 
         user_row_ids = user_row_ids.numpy().astype(np.int64, copy=False)
+        # 预处理 cumcount 给出目标在完整轨迹中的位置，即可读取的历史前缀长度。
         seq_lens = batch_dict["seq_len"].int().cpu().numpy()
 
         user_item_seqs = side["user_item_seqs"][user_row_ids]
@@ -530,12 +536,15 @@ class BlockedBatchCollator(object):
         batch_item_seqs = self._fast_pad(user_item_seqs, seq_lens)
         batch_action_seqs = self._fast_pad(user_action_seqs, seq_lens)
 
+        # mask [B,L] 区分有效曝光和 padding；六反馈全零的曝光也属于有效历史。
         mask = torch.from_numpy((batch_item_seqs > 0).astype(np.float32))
 
         batch_action_tensor = torch.from_numpy(
             batch_action_seqs.astype(np.int64, copy=False)
         )
 
+        # multi_masks 只标记历史行为包含哪类正反馈，与通用 padding mask 含义不同。
+        # 当前三个模型默认 get_inputs 不请求 multi_masks，不会因此仅保留正反馈历史。
         token_task_mask = self.action_task_table[batch_action_tensor]
         token_task_mask = token_task_mask * mask.unsqueeze(-1)
         multi_masks = [token_task_mask[:, :, t] for t in range(token_task_mask.shape[-1])]
@@ -543,10 +552,12 @@ class BlockedBatchCollator(object):
         batch_size = len(user_row_ids)
         seq_total_len = batch_item_seqs.shape[1] + 1
 
+        # item_dict 最终的时间维是 [历史 L 个位置, 当前候选]；最后一列不是历史。
         batch_items = np.empty((batch_size, seq_total_len), dtype=np.int64)
         batch_items[:, :-1] = batch_item_seqs
         batch_items[:, -1] = batch_dict["item_index"].cpu().numpy().astype(np.int64, copy=False)
 
+        # 只复制已发生历史的 action；目标位置保持 0，阻断当前反馈标签进入输入。
         batch_actions = np.zeros((batch_size, seq_total_len), dtype=batch_action_seqs.dtype)
         batch_actions[:, :-1] = batch_action_seqs
 
@@ -567,6 +578,7 @@ class BlockedBatchCollator(object):
             bad_item = flat_items[(row_ids < 0).numpy()][0]
             raise IndexError(f"item_index={bad_item} does not exist in blocked item_info. file={item_info_file}")
 
+        # 用块内 item_index 查 item_info，恢复全局 item_id 与视频属性供 embedding 使用。
         item_dict = {}
         for col, tensor_data in side["item_tensors"].items():
             item_dict[col] = tensor_data[row_ids].view(batch_size, seq_total_len)
@@ -576,6 +588,9 @@ class BlockedBatchCollator(object):
 
         return batch_dict, item_dict, mask, multi_masks
 
+    # 完整轨迹可能存有未来事件；可见范围必须止于 l=seq_len，不能直接取完整轨迹末尾。
+    # 主配置 padding="pre"：历史过长取最近 L 条，较短则左补 0。
+    # 当前 post 分支取前缀中最早 L 条，与 pre 的最近截断语义不同。
     def _fast_pad(self, user_seqs, seq_lens):
         max_len = self.max_len
         batch_size = len(user_seqs)
@@ -589,6 +604,7 @@ class BlockedBatchCollator(object):
 
             if self.padding == "pre":
                 if l >= max_len:
+                    # Python 右端开区间，位置 l 的当前目标及之后事件均不会进入历史。
                     result[i, :] = seq[l - max_len:l]
                 else:
                     result[i, max_len - l:] = seq[:l]

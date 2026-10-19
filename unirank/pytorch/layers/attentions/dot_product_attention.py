@@ -77,6 +77,7 @@ class ScaledDotProductAttention(nn.Module):
             return output, None
 
         attention_scores = torch.matmul(Q, K.transpose(-2, -1))
+        
         if scale is not None:
             attention_scores = attention_scores / scale
         attention_weights = attention_scores
@@ -84,6 +85,7 @@ class ScaledDotProductAttention(nn.Module):
             attention_weights = self.attention_activation(attention_scores)
 
         valid_mask = mask.bool() if mask is not None else None
+
         if is_causal:
             query_length, key_length = Q.size(-2), K.size(-2)
             causal_mask = torch.ones(
@@ -93,8 +95,10 @@ class ScaledDotProductAttention(nn.Module):
                 device=Q.device,
             ).tril()
             valid_mask = causal_mask if valid_mask is None else valid_mask & causal_mask
+
         if valid_mask is not None:
             attention_weights = attention_weights.masked_fill(~valid_mask, 0.0)
+
         attention_weights = F.dropout(
             attention_weights,
             p=self.dropout_rate,
