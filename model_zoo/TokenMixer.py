@@ -128,7 +128,6 @@ class TokenMixer(MultiTaskModel):
                                         seq_pooling_emb.view(batch_size, -1, self.embedding_dim)], dim=1)
         unified_tokens = self.unified_tokenizer_layer(feature_embeddings)  # B x (1 + num_group_token) x token_dim
 
-
         # unified model
         unified_tokens = self.activation_checkpoint(
             self.unified_interaction_layers,
@@ -206,8 +205,6 @@ class TokenMixerBlocks(nn.Module):
         ])
 
     def forward(self, x: torch.Tensor): # B x T x token_dim
-        if x.size(1) != self.num_tokens:
-            raise ValueError(f"TokenMixerBlocks expects {self.num_tokens} tokens, got {x.size(1)}.")
         if self.pad_dim > 0:
             x = F.pad(x, (0, self.pad_dim))
         for i in range(self.num_layers):

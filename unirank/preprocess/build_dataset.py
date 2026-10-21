@@ -133,7 +133,7 @@ def build_dataset(feature_encoder, train_data=None, valid_data=None, test_data=N
         )
     
     else: # skip rebuilding data but only compute feature_map.json
-        feature_encoder.fit(train_ddf=None, rebuild_dataset=False, **kwargs)
+        feature_encoder.fit_encoded()
     
     # Return processed data splits
     return train_data, valid_data, test_data

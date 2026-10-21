@@ -32,7 +32,7 @@ Base:
     dense_learning_rate: 1.0e-4
     sparse_learning_rate: 0.05
     dense_weight_decay: 0
-    enable_torch_compile: True
+    enable_torch_compile: False
     gradient_checkpointing: False
 
 RankMixer_KuaiRand_Video_Action:
@@ -114,9 +114,7 @@ TokenMixer_KuaiRand_Video_Action: # This is a config template
     accumulation_steps: 1
 
 
-# Append the complete contents to the existing config/model_config.yaml.
-# The current repository's Base supplies optimizer and data-loader settings.
-# This file alone is not automatically discovered by the configuration loader.
+# LONGER 历史建模 + 可选的 dense RankMixer 特征交互。
 
 LONGER_RankMixer_NoMixer_KuaiRand_Video_Action: &longer_readout_base
     model: LONGER_RankMixer

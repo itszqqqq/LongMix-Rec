@@ -40,16 +40,6 @@ def build_unified_tokenizer(tokenizer_type,
     """
     normalized_type = str(tokenizer_type).strip().lower()
     canonical_types = {name.lower(): name for name in TOKENIZER_TYPES}
-    if normalized_type not in canonical_types:
-        raise ValueError(
-            "tokenizer_type must be one of {}, got {!r}.".format(
-                TOKENIZER_TYPES, tokenizer_type
-            )
-        )
-    if num_tokens <= 0:
-        raise ValueError("num_tokens must be positive.")
-    if num_fields <= 0:
-        raise ValueError("num_fields must be positive.")
 
     tokenizer_type = canonical_types[normalized_type]
     if tokenizer_type == "Chunk":
@@ -61,7 +51,7 @@ def build_unified_tokenizer(tokenizer_type,
             layer_norm=layer_norm,
         )
         return tokenizer, num_tokens, False
-    
+
     if tokenizer_type == "Auto":
         tokenizer = AutoSplitTokenizer(
             input_dim=input_dim,
@@ -72,14 +62,6 @@ def build_unified_tokenizer(tokenizer_type,
         )
         return tokenizer, num_tokens, False
 
-    expected_input_dim = field_dim * num_fields
-    if input_dim != expected_input_dim:
-        raise ValueError(
-            "{} tokenization requires uniform field dimensions: "
-            "input_dim={} but num_fields * field_dim={}.".format(
-                tokenizer_type, input_dim, expected_input_dim
-            )
-        )
     if tokenizer_type == "Field":
         tokenizer = FieldWiseTokenizer(
             input_dim=field_dim,

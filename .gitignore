@@ -11,6 +11,7 @@ checkpoints/
 # Downloaded and processed datasets
 /data/KuaiRand/KuaiRand-*/
 /data/KuaiRand_Video_Action*/
+*.tar
 *.tar.gz
 *.zip
 *.parquet

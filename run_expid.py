@@ -52,15 +52,17 @@ if __name__ == '__main__':
       python run_expid.py
 
     DDP multi-card (single machine):
-      torchrun --standalone --nproc_per_node=4 run_expid.py
+      torchrun --standalone --nproc_per_node=4 run_expid.py --gpu 0,1,2,3
     """
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, default='./config/', help='The config directory.')
     parser.add_argument('--expid', type=str, default='RankMixer_KuaiRand_Video_Action', help='The experiment id to run.')
-    parser.add_argument('--gpu', type=str, default='0,1,2,3', help='GPU ids, e.g. "0" or "0,1,2,3"; use "-1" for cpu')
-    parser.add_argument('--enable_bf16', type=bool, default=True, help='Enable bfloat16 mixed precision training (default: True).')
+    parser.add_argument('--gpu', type=str, default='0', help='GPU ids, e.g. "0" or "0,1,2,3"; use "-1" for cpu')
+    parser.add_argument('--enable_bf16', action=argparse.BooleanOptionalAction, default=None,
+                        help='覆盖配置中的 BF16 开关；--no-enable_bf16 关闭混合精度。')
     args = vars(parser.parse_args())
 
+    distributed = False
     try:
         gpu_ids = parse_gpu_ids(args['gpu'])
         setup_visible_devices(gpu_ids)
@@ -121,7 +123,8 @@ if __name__ == '__main__':
         params['world_size'] = world_size
 
         # bf16 switch: command line parameters override fields of the same name in config (if present)
-        params['enable_bf16'] = args['enable_bf16']
+        if args['enable_bf16'] is not None:
+            params['enable_bf16'] = args['enable_bf16']
 
         if is_main_process(rank):
             set_logger(params)
@@ -235,10 +238,7 @@ if __name__ == '__main__':
 
             if distributed and dist.is_available() and dist.is_initialized():
                 distributed_barrier(local_rank)
-            if is_main_process(rank):
-                model.delete_checkpoint()
-            if distributed and dist.is_available() and dist.is_initialized():
-                distributed_barrier(local_rank)
+            # 保留最佳 checkpoint，供后续评估、推理和面试演示使用。
 
     finally:
         if distributed and dist.is_available() and dist.is_initialized():

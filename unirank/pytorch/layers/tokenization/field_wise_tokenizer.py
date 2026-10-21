@@ -24,8 +24,6 @@ class FieldWiseTokenizer(nn.Module):
     def __init__(self, input_dim, token_dim, num_tokens, activation="SiLU",
                  layer_norm=True):
         super(FieldWiseTokenizer, self).__init__()
-        if num_tokens <= 0:
-            raise ValueError("num_tokens must be positive.")
         self.input_dim = input_dim
         self.num_tokens = num_tokens
         self.token_mlps = nn.ModuleList([
@@ -39,18 +37,6 @@ class FieldWiseTokenizer(nn.Module):
         ])
 
     def forward(self, token_inputs):
-        if token_inputs.dim() != 3:
-            raise ValueError(
-                "FieldWiseTokenizer expects a 3D tensor, got shape {}.".format(
-                    tuple(token_inputs.shape)
-                )
-            )
-        if token_inputs.size(1) != self.num_tokens or token_inputs.size(2) != self.input_dim:
-            raise ValueError(
-                "FieldWiseTokenizer expects shape [B, {}, {}], got {}.".format(
-                    self.num_tokens, self.input_dim, tuple(token_inputs.shape)
-                )
-            )
         return torch.stack([
             mlp(token_inputs[:, i, :])
             for i, mlp in enumerate(self.token_mlps)

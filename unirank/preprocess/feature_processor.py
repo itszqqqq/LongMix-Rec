@@ -196,6 +196,26 @@ class FeatureProcessor(object):
         self.save_vocab(self.vocab_file)
         logging.info("Set feature processor done.")
 
+    def fit_encoded(self):
+        """已编码的 Parquet 只需字段规格，无需为千万级 ID 构造重复词表。"""
+        spec_keys = ("type", "source", "vocab_size", "embedding_dim", "emb_output_dim",
+                     "feature_encoder", "share_embedding", "max_len", "padding")
+        self.feature_map.total_features = 0
+        for col in self.feature_cols:
+            if not col["active"]:
+                continue
+            spec = {key: col[key] for key in spec_keys if key in col}
+            if col["type"] in ("categorical", "sequence"):
+                spec["padding_idx"] = 0
+                if "share_embedding" not in spec:
+                    self.feature_map.total_features += spec["vocab_size"]
+            elif col["type"] == "numeric":
+                self.feature_map.total_features += 1
+            self.feature_map.features[col["name"]] = spec
+        self.feature_map.num_fields = self.feature_map.get_num_fields()
+        self.feature_map.set_column_index()
+        self.feature_map.save(self.json_file)
+
     def fit_meta_col(self, col):
         name = col["name"]
         feature_type = col["type"]

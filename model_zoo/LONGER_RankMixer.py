@@ -19,20 +19,21 @@ class LongerEncoder(nn.Module):
     """Encode embedded history; return all q+G outputs and their validity mask."""
 
     def __init__(
-        self, item_info_dim, non_item_dim, token_dim=256, max_len=100,
-        num_groups=4, query_size=10, num_global_tokens=4,
-        num_heads=2, num_layers=1, expansion_factor=4,
+        self,
+        item_info_dim,
+        non_item_dim,
+        token_dim=256,
+        max_len=100,
+        num_groups=4,
+        query_size=10,
+        num_global_tokens=4,
+        num_heads=2,
+        num_layers=1,
+        expansion_factor=4,
         dnn_activations="ReLU",
     ):
         super().__init__()
-        if min(item_info_dim, non_item_dim, token_dim, max_len, num_groups,
-               num_global_tokens, num_heads, expansion_factor) <= 0:
-            raise ValueError("Encoder dimensions, groups, heads and expansion must be positive.")
-        if max_len % num_groups or token_dim % num_heads:
-            raise ValueError("max_len % num_groups and token_dim % num_heads must be zero.")
-        if not 1 <= query_size <= max_len // num_groups or num_layers < 0:
-            raise ValueError("Invalid merged query count or encoder layer count.")
-        
+
         self.item_info_dim = item_info_dim
         self.context_target_dim = non_item_dim + item_info_dim
         self.max_len = max_len
@@ -46,17 +47,23 @@ class LongerEncoder(nn.Module):
             torch.empty(max_len, item_info_dim)
         )
         nn.init.normal_(self.history_position_embedding, std=0.02)
-        self.item_token_proj = (
-            nn.Linear(item_info_dim, token_dim)
-            if item_info_dim != token_dim else nn.Identity()
-        )
+
+        # self.item_token_proj = (
+        #     nn.Linear(item_info_dim, token_dim)
+        #     if item_info_dim != token_dim else nn.Identity()
+        # )
+        if self.item_info_dim != token_dim:
+            self.item_token_proj = nn.Linear(self.item_info_dim, token_dim)
+        else:
+            self.item_token_proj = nn.Identity()
+
         # First tokenizer: user/context + candidate -> LONGER global queries.
         self.global_tokenizer = AutoSplitTokenizer(
             input_dim=self.context_target_dim,
             token_dim=token_dim,
             num_tokens=num_global_tokens,
         )
-        self.block = LONGERBlock(
+        self.longerblock = LONGERBlock(
             input_dim=token_dim,
             num_heads=num_heads,
             num_groups=num_groups,
@@ -67,39 +74,35 @@ class LongerEncoder(nn.Module):
         )
 
     def forward(self, history_emb, context_target_emb, history_mask):
-        if history_emb.ndim != 3 or history_emb.size(-1) != self.item_info_dim:
-            raise ValueError("history_emb must have shape [B,L,item_info_dim].")
-        batch_size, length, _ = history_emb.shape
-        if not 0 < length <= self.max_len or length % self.num_groups:
-            raise ValueError("History window must be within max_len and divisible by num_groups.")
-        if self.query_size > length // self.num_groups:
-            raise ValueError("query_size exceeds the runtime number of merged groups.")
-        if context_target_emb.shape != (batch_size, self.context_target_dim):
-            raise ValueError("context_target_emb must have shape [B,non_item_dim+item_info_dim].")
-        if history_mask.shape != history_emb.shape[:2]:
-            raise ValueError("history_mask must have shape [B,L].")
-        history_mask = history_mask.to(device=history_emb.device, dtype=torch.bool)
+        batch_size, length, _ = history_emb.shape  # shape:(B, seq_len, item_info_dim)
 
+        history_mask = history_mask.to(device=history_emb.device, dtype=torch.bool)
         positions = self.history_position_embedding[-length:].unsqueeze(0)
-        history_tokens = self.item_token_proj(history_emb + positions)
+
+        history_tokens = self.item_token_proj(history_emb + positions)  # [B,max_len,item_info_dim] → [B,max_len,token_dim]
         history_tokens = _zero_padding(history_tokens, history_mask)
+
         global_tokens = self.global_tokenizer(context_target_emb)
-        encoded = self.block(history_tokens, global_tokens, history_mask)
+        encoded = self.longerblock(history_tokens, global_tokens, history_mask)
+        # [最近 q 个合并历史 query 的输出 | G 个 global query 的输出]
 
         # This mirrors the current LONGERBlock's query order exactly:
         # [last q merged-history queries, G global queries].
         merged_mask = history_mask.reshape(
             batch_size, length // self.num_groups, self.num_groups
         ).any(dim=-1)
+        # [B,L] -> reshape -> [B,L/K,K] -> any(dim=-1) -> [B,L/K]
+        # .any(dim=-1) 表示：组内至少有一个有效位置，这个合并组就有效
+
         global_mask = torch.ones(
             (batch_size, self.num_global_tokens),
             dtype=torch.bool, device=encoded.device,
-        )
+        )   #  global_mask：[B, num_global_tokens]，值全为 True
+
         output_mask = torch.cat([
             merged_mask[:, -self.query_size:], global_mask,
-        ], dim=1)
-        if encoded.shape[:2] != output_mask.shape:
-            raise ValueError("LONGER output order/length no longer matches the readout mask.")
+        ], dim=1)   # [最近 q 个合并组的有效性 | num_global_tokens 个 True]
+
         return encoded, output_mask
 
 
@@ -107,48 +110,43 @@ class MaskedMeanReadout(nn.Module):
     """Read all valid encoded queries, using FP32 for BF16/FP16 accumulation."""
 
     def forward(self, encoded, output_mask):
-        if encoded.ndim != 3 or output_mask.shape != encoded.shape[:2]:
-            raise ValueError("Expected encoded [B,N,D] and output_mask [B,N].")
-
         valid = output_mask.to(device=encoded.device, dtype=torch.bool)
         clean = encoded.masked_fill(~valid.unsqueeze(-1), 0.0)
-        accumulator = clean.float() if clean.dtype in (torch.float16, torch.bfloat16) else clean
-        count = valid.sum(dim=1, keepdim=True).clamp_min(1).to(accumulator.dtype)
+        accumulator = clean.float() if clean.dtype in (torch.float16, torch.bfloat16) else clean  # 如果输入为 FP16 或 BF16，先转为 FP32，再进行求和与除法，减少低精度累计误差
+        count = valid.sum(dim=1, keepdim=True).clamp_min(1).to(accumulator.dtype)  # 计算每条样本的有效 token 数
 
-        return (accumulator.sum(dim=1) / count).to(encoded.dtype)
+        return (accumulator.sum(dim=1) / count).to(encoded.dtype)    # 先沿 token 维求和 [B,N,D] → [B,D]，再除以每条样本自己的有效 token 数
+        #  .to(encoded.dtype) 将结果恢复为输入精度，例如 FP32 计算后转回 BF16，便于接入后续网络
 
 
 class LONGER_RankMixer(MultiTaskModel):
     def __init__(
-        self, feature_map, model_id="LONGER_RankMixer",
-        task="binary_classification", gpu=-1,
-        embedding_dim=16, token_dim=256, max_len=100,
-        num_groups=4, query_size=10, num_global_tokens=4,
-        num_rank_tokens=8, num_heads=2,
-        longer_num_layers=1, longer_expansion_factor=4,
-        rankmixer_num_layers=1, rankmixer_expansion_factor=2,
-        dnn_activations="ReLU", tower_hidden_units=(128, 64),
-        tower_activations="ReLU", num_tasks=None, net_dropout=0,
-        accumulation_steps=1, **kwargs,
+        self,
+        feature_map,
+        model_id="LONGER_RankMixer",
+        task="binary_classification",
+        gpu=-1,
+        embedding_dim=16,
+        token_dim=256,
+        max_len=100,
+        num_groups=4,
+        query_size=10,
+        num_global_tokens=4,
+        num_rank_tokens=8,
+        num_heads=2,
+        longer_num_layers=1,
+        longer_expansion_factor=4,
+        rankmixer_num_layers=1,
+        rankmixer_expansion_factor=2,
+        dnn_activations="ReLU",
+        tower_hidden_units=(128, 64),
+        tower_activations="ReLU",
+        num_tasks=None, net_dropout=0,
+        accumulation_steps=1,
+        **kwargs,
     ):
-        # Reject legacy aliases that would silently obscure the two stages.
-        legacy_keys = {"num_layers", "expansion_factor", "num_ns_token", "tokenizer_type"} & kwargs.keys()
-        if legacy_keys:
-            raise ValueError(
-                f"Use the explicit encoder/global/rank settings instead of {sorted(legacy_keys)}."
-            )
-        actual_tasks = len(feature_map.labels)
-        num_tasks = actual_tasks if num_tasks is None else num_tasks
-        if actual_tasks == 0 or num_tasks != actual_tasks:
-            raise ValueError("num_tasks must equal len(feature_map.labels) > 0.")
-        if num_rank_tokens <= 0 or rankmixer_num_layers < 0 or rankmixer_expansion_factor <= 0:
-            raise ValueError("Invalid rank token count, layer count or expansion.")
-        if accumulation_steps <= 0:
-            raise ValueError("accumulation_steps must be positive.")
-        loss = kwargs.get("loss", "binary_crossentropy")
-        if isinstance(loss, list) and len(loss) != num_tasks:
-            raise ValueError("loss list must have one entry per label.")
-        
+        num_tasks = len(feature_map.labels) if num_tasks is None else num_tasks
+
         super().__init__(
             feature_map, model_id=model_id, task=task,
             num_tasks=num_tasks, gpu=gpu, **kwargs,
@@ -162,27 +160,31 @@ class LONGER_RankMixer(MultiTaskModel):
         self.item_info_dim = 0
         self.non_item_dim = 0
 
-        for name, spec in feature_map.features.items():
-            if name in feature_map.labels or spec.get("type") == "meta":
+        for feat, spec in feature_map.features.items():
+            if feat in feature_map.labels or spec.get("type") == "meta":
                 continue
-            width = spec.get("emb_output_dim", spec.get("embedding_dim", embedding_dim))
+            emb_dim = spec.get("emb_output_dim", spec.get("embedding_dim", embedding_dim))
             if spec.get("source") in ("item", "action"):
-                self.item_info_dim += width
+                self.item_info_dim += emb_dim
             else:
-                self.non_item_dim += width
+                self.non_item_dim += emb_dim
 
         # One shared embedding module for history, candidate and user/context.
         self.embedding_layer = FeatureEmbedding(feature_map, embedding_dim)
         self.longer_encoder = LongerEncoder(
             item_info_dim=self.item_info_dim,
             non_item_dim=self.non_item_dim,
-            token_dim=token_dim, max_len=max_len,
-            num_groups=num_groups, query_size=query_size,
-            num_global_tokens=num_global_tokens, num_heads=num_heads,
+            token_dim=token_dim,
+            max_len=max_len,
+            num_groups=num_groups,
+            query_size=query_size,
+            num_global_tokens=num_global_tokens,
+            num_heads=num_heads,
             num_layers=longer_num_layers,
             expansion_factor=longer_expansion_factor,
             dnn_activations=dnn_activations,
         )
+
         self.readout = MaskedMeanReadout()
         self.rank_input_dim = self.non_item_dim + self.item_info_dim + token_dim
         # Second tokenizer: raw user/context + candidate + LONGER summary.
@@ -193,14 +195,17 @@ class LONGER_RankMixer(MultiTaskModel):
         )
         self.rankmixer = (
             RankMixerBlock(
-                input_dim=token_dim, num_ns_token=num_rank_tokens,
+                input_dim=token_dim,
+                num_ns_token=num_rank_tokens,
                 num_layers=rankmixer_num_layers,
-                expand=rankmixer_expansion_factor, net_dropout=net_dropout,
+                expand=rankmixer_expansion_factor,
+                net_dropout=net_dropout,
             ) if rankmixer_num_layers > 0 else nn.Identity()
         )
         self.tower = nn.ModuleList([
             MLP_Block(
-                input_dim=token_dim, output_dim=1,
+                input_dim=token_dim,
+                output_dim=1,
                 hidden_units=list(tower_hidden_units),
                 hidden_activations=tower_activations,
                 output_activation=None, dropout_rates=net_dropout,
@@ -209,18 +214,18 @@ class LONGER_RankMixer(MultiTaskModel):
 
         # Optimizers see every component, including both tokenizers.
         self.compile(
-            kwargs.get("dense_optimizer"), loss,
+            kwargs.get("dense_optimizer"), kwargs.get("loss", "binary_crossentropy"),
             kwargs.get("dense_learning_rate"),
         )
         self.reset_parameters()
         self.model_to_device()
 
-    def encode_inputs(self, inputs):
+    def forward(self, inputs):
         batch_dict, item_dict, history_mask = self.get_inputs(inputs)
         batch_size = history_mask.size(0)
-
+        # item_dict:{"key": [history_items..., target_item]}
         item_seq_emb = self.embedding_layer(item_dict, flatten_emb=True)
-        item_seq_emb = item_seq_emb.reshape(batch_size, -1, self.item_info_dim)
+        item_seq_emb = item_seq_emb.reshape(batch_size, -1, self.item_info_dim) # (B, T+1, item_info_dim)，其中 T 是历史 item 的数量
 
         target_emb = item_seq_emb[:, -1, :]
         history_emb = item_seq_emb[:, :-1, :]
@@ -231,15 +236,11 @@ class LONGER_RankMixer(MultiTaskModel):
         encoded, output_mask = self.activation_checkpoint(
             self.longer_encoder, history_emb, context_target_emb, history_mask,
         )
-        return user_context_emb, target_emb, encoded, output_mask
-
-    def forward(self, inputs):
-        user_context_emb, target_emb, encoded, output_mask = self.encode_inputs(inputs)
         h_long = self.readout(encoded, output_mask)  # [B,D], candidate-aware.
 
         features = torch.cat([user_context_emb, target_emb, h_long], dim=-1)
         tokens = self.rank_tokenizer(features)  # [B,T_rank,D], all fixed valid slots.
-        
+
         mixed = self.activation_checkpoint(self.rankmixer, tokens)
         bottom = mixed.mean(dim=1)
 

@@ -39,7 +39,8 @@ class RankDataLoader(object):
             )     
             if valid_data:
                 valid_gen = data_loader(feature_map, valid_data, split="valid",
-                                        batch_size=batch_size, shuffle=False, **kwargs)
+                                        batch_size=batch_size, shuffle=False,
+                                        **dict(kwargs, drop_last=False))
                 logging.info(
                     "Validation samples: total/{:d}, blocks/{:d}"
                     .format(valid_gen.num_samples, valid_gen.num_blocks)
@@ -48,7 +49,7 @@ class RankDataLoader(object):
         if stage in ["both", "test"]:
             if test_data:
                 test_gen = data_loader(feature_map, test_data, split="test", batch_size=batch_size,
-                                       shuffle=False, **kwargs)
+                                       shuffle=False, **dict(kwargs, drop_last=False))
                 logging.info(
                     "Test samples: total/{:d}, blocks/{:d}"
                     .format(test_gen.num_samples, test_gen.num_blocks)

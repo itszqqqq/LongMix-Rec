@@ -208,7 +208,7 @@ def load_model_config(config_dir, experiment_id):
         raise RuntimeError('config_dir={} is not valid!'.format(config_dir))
     found_params = dict()
     for config in model_configs:
-        with open(config, 'r') as cfg:
+        with open(config, 'r', encoding='utf-8') as cfg:
             config_dict = yaml.load(cfg, Loader=yaml.FullLoader)
             if 'Base' in config_dict:
                 found_params['Base'] = config_dict['Base']
@@ -229,7 +229,7 @@ def load_dataset_config(config_dir, dataset_id):
     if not dataset_configs:
         dataset_configs = glob.glob(os.path.join(config_dir, "dataset_config/*.yaml"))
     for config in dataset_configs:
-        with open(config, "r") as cfg:
+        with open(config, "r", encoding="utf-8") as cfg:
             config_dict = yaml.load(cfg, Loader=yaml.FullLoader)
             if dataset_id in config_dict:
                 params.update(config_dict[dataset_id])

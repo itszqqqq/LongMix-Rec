@@ -46,12 +46,6 @@ class ScaledDotProductAttention(nn.Module):
             if attention_activation_type is None
             else str(attention_activation_type).strip().lower()
         )
-        if activation_key not in self.SUPPORTED_ACTIVATIONS:
-            supported = ", ".join(self.SUPPORTED_ACTIVATIONS.values())
-            raise ValueError(
-                "Unsupported attention_activation_type={!r}. Expected one of: {}"
-                .format(attention_activation_type, supported)
-            )
         self.attention_activation_type = self.SUPPORTED_ACTIVATIONS[activation_key]
         self.attention_activation = (
             None
@@ -77,7 +71,7 @@ class ScaledDotProductAttention(nn.Module):
             return output, None
 
         attention_scores = torch.matmul(Q, K.transpose(-2, -1))
-        
+
         if scale is not None:
             attention_scores = attention_scores / scale
         attention_weights = attention_scores

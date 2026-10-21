@@ -26,8 +26,6 @@ from unirank.pytorch.layers.tokenization import AutoSplitTokenizer
 def _zero_padding(tokens, mask):
     if mask is None:
         return tokens
-    if mask.shape != tokens.shape[:2]:
-        raise ValueError("[LONGER] padding mask must match tokens [B, L].")
     valid = mask.to(device=tokens.device, dtype=torch.bool)
     return tokens.masked_fill(~valid.unsqueeze(-1), 0.0)
 
@@ -40,15 +38,11 @@ def _masked_attention(attention, Q, K, V, scale, key_mask=None,
                          dtype=torch.bool, device=Q.device)
 
     if key_mask is not None:
-        if key_mask.shape != (Q.size(0), K.size(-2)):
-            raise ValueError("[LONGER] key mask must match [B, KV_length].")
         allowed = allowed & key_mask.to(device=Q.device, dtype=torch.bool).reshape(allowed.shape)
 
     if causal_mask is not None:
-        if causal_mask.shape != (Q.size(-2), K.size(-2)):
-            raise ValueError("[LONGER] causal mask must match [Q_length, KV_length].")
         allowed = allowed & causal_mask.to(device=Q.device, dtype=torch.bool)
-    
+
     has_key = allowed.any(dim=-1, keepdim=True)   # dim=-1 是 key 维；判断每个 query 有没有合法 key。
     first_key = torch.arange(K.size(-2), device=Q.device) == 0  # K.size(-2)取得 key 的数量
     # 无合法 key 时临时放行 key 0，计算后丢弃该行，并由调用方在 FFN 后再次清零。
@@ -75,9 +69,9 @@ class LONGER(MultiTaskModel):
                  token_dim=256,   # 模型使用的 token 维度
                  num_ns_token=4,  # 非序列/global token 数
                  num_groups=4,  # 每组包含 4 个历史 token
-                 query_size=10,   # [修改 3] 选取最近 n 个合并后的历史组作 query
+                 query_size=10,   # 选取最近 n 个合并后的历史组作 query
                  net_dropout=0,
-                 accumulation_steps=1,
+                 accumulation_steps=1,    # 训练时梯度累积次数
                  max_len=100,
                  **kwargs):
         super(LONGER, self).__init__(feature_map,
@@ -94,20 +88,6 @@ class LONGER(MultiTaskModel):
         self.max_len = max_len
         self.num_groups = num_groups
         self.query_size = query_size
-
-        # [修改 3] 提前拒绝无效长度/组大小，避免除零及后续预测塔维度不匹配。
-        if max_len <= 0 or num_groups <= 0:
-            raise ValueError("[LONGER] max_len and num_groups must be positive.")
-        if max_len % num_groups != 0:
-            raise ValueError(
-                f"[LONGER] sequence length Ls={max_len} is not divisible by num_groups={num_groups}. "
-                f"Please truncate/pad in data pipeline or set compatible num_groups."
-            )
-        if not 1 <= query_size <= max_len // num_groups:
-            raise ValueError(
-                f"[LONGER] query_size={query_size} must be in [1, {max_len // num_groups}] "
-                f"for max_len={max_len}, num_groups={num_groups}."
-            )
 
         self.item_info_dim = 0
         self.non_item_dim = 0
@@ -185,11 +165,7 @@ class LONGER(MultiTaskModel):
 
         # s_tokens = self.item_token_proj(sequence_emb)
         length = sequence_emb.size(1)
-        if length <= 0 or length > self.max_len:
-            raise ValueError(f"[LONGER] history length {length} must be in [1, {self.max_len}].")
-        if mask.shape != sequence_emb.shape[:2]:
-            raise ValueError("[LONGER] mask must match history [B, Ls].")
-        
+
         # 位置编码。与左 padding 对齐：短窗口使用位置表的末尾，最新行为固定在最后位置。
         positions = self.history_position_embedding[-length:].unsqueeze(0)
         s_tokens = self.item_token_proj(sequence_emb + positions)
@@ -230,9 +206,6 @@ class LONGERBlock(nn.Module):
         super(LONGERBlock, self).__init__()
         self.num_layers = num_layers
         self.query_size = query_size
-        # [修改 3] 独立使用 LONGERBlock 时也拒绝 q=0 和 K<=0。
-        if num_groups <= 0 or query_size <= 0:
-            raise ValueError("[LONGER] num_groups and query_size must be positive.")
 
         self.inner_trans_norm = nn.LayerNorm(input_dim)
         self.cross_attention_norm = nn.LayerNorm(input_dim)
@@ -269,17 +242,9 @@ class LONGERBlock(nn.Module):
         ns_tokens: B x Lns x D
         mask: B x Ls
         """
-        # [修改 3] 按实际 padding 后的长度检查，支持构造后传入较短窗口的情况。
         length = s_tokens.size(1)
         group_size = self.inner_trans.num_groups
-        if length <= 0 or length % group_size != 0:
-            raise ValueError("[LONGER] history length must be positive and divisible by num_groups.")
         merged_length = length // group_size
-        if not 1 <= self.query_size <= merged_length:
-            raise ValueError(
-                f"[LONGER] query_size={self.query_size} must be in [1, {merged_length}] "
-                f"for runtime history length={length}, num_groups={group_size}."
-            )
 
         # [修改 1] 原始 history mask -> merged mask -> query/key mask。
         if mask is None:
@@ -289,14 +254,14 @@ class LONGERBlock(nn.Module):
 
         s_tokens = _zero_padding(s_tokens, mask)
         s_tokens = _zero_padding(self.inner_trans_norm(s_tokens), mask)
-        
+
         merge_s_tokens = self.inner_trans(s_tokens, mask=mask)
         merged_mask = mask.reshape(mask.size(0), merged_length, group_size).any(dim=-1)
-        
+
         sampled_s_tokens = merge_s_tokens[:, -self.query_size:, :]
         sampled_mask = merged_mask[:, -self.query_size:]
         global_mask = torch.ones(ns_tokens.shape[:2], dtype=torch.bool, device=ns_tokens.device)
-        
+
         q_tokens = torch.cat([sampled_s_tokens, ns_tokens], dim=1)
         kv_tokens = torch.cat([merge_s_tokens, ns_tokens], dim=1)
         query_mask = torch.cat([sampled_mask, global_mask], dim=1)
@@ -335,8 +300,6 @@ class InnerTrans(nn.Module):
         self.input_dim = input_dim
         self.num_groups = num_groups
 
-        if num_groups <= 0:  # [修改 3] 独立调用时也检查组大小。
-            raise ValueError("[LONGER] num_groups must be positive.")
         hidden_dim = input_dim * num_groups
 
         self.W_q = nn.Linear(input_dim, input_dim, bias=False)
@@ -357,11 +320,6 @@ class InnerTrans(nn.Module):
             merge_s_tokens: B x Lms x D
         """
         B, Ls, D = s_tokens.shape   
-
-        if Ls <= 0 or Ls % self.num_groups != 0:
-            raise ValueError(
-                f"[InnerTrans] sequence length Ls={Ls} is not divisible by num_groups={self.num_groups}."
-            )
 
         Lms = Ls // self.num_groups  
         if mask is None:
@@ -431,9 +389,6 @@ class CrossCausalAttention(nn.Module):
         K = K.view(B, -1, self.num_heads, self.head_dim).transpose(1, 2)
         V = V.view(B, -1, self.num_heads, self.head_dim).transpose(1, 2)
 
-        # [修改 2] 非方形 attention 不能猜测 query 的原时间位置，必须由调用方传入。
-        if causal_mask is None:
-            raise ValueError("[LONGER] CrossCausalAttention requires an explicit causal_mask.")
         output, has_key = _masked_attention(
             self.dot_attention, Q, K, V, scale=self.head_dim ** 0.5,
             key_mask=key_mask, causal_mask=causal_mask,

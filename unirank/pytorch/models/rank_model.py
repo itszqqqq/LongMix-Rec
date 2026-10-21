@@ -557,7 +557,11 @@ class BaseModel(nn.Module):
         self.train()  # All ranks need to restore train mode
 
     def train_step(self, batch_data):
-        is_update_step = ((self._batch_index + 1) % self.accumulation_steps == 0)
+        # 最后一组不足 accumulation_steps 时，也须在验证/保存前完成更新。
+        is_last_batch = self._batch_index + 1 == self._steps_per_epoch
+        is_update_step = ((self._batch_index + 1) % self.accumulation_steps == 0) or is_last_batch
+        window_start = (self._batch_index // self.accumulation_steps) * self.accumulation_steps
+        accumulation_size = min(self.accumulation_steps, self._steps_per_epoch - window_start)
         use_no_sync = (
                 self._is_distributed()
                 and (self._ddp_model is not None)
@@ -580,8 +584,8 @@ class BaseModel(nn.Module):
             }
 
             y_true = self.get_labels(batch_data)
-            loss = self.compute_loss(return_dict, y_true) / self.accumulation_steps
-            loss.backward()
+            loss = self.compute_loss(return_dict, y_true)
+            (loss / accumulation_size).backward()
 
         if is_update_step:
             self._clip_dense_gradients()
@@ -618,7 +622,7 @@ class BaseModel(nn.Module):
             num_batches += 1
 
             loss = self.train_step(batch_data)
-            loss_value = loss.item() * self.accumulation_steps
+            loss_value = loss.item()
             train_loss += loss_value
 
             if use_tqdm:
@@ -654,12 +658,10 @@ class BaseModel(nn.Module):
             if self._stop_training:
                 break
 
-        # ---- flush residual gradient ----
-        # Note: If you use no_sync for gradient accumulation, the final residual gradient will be less than accumulation_steps
-        # In the original implementation optimizer.step() is used directly, and these gradients may not have gone through DDP allreduce.
-        # In order to maintain behavioral compatibility, the original logic is still retained here; a more strict approach is to let dataloader/drop_last
-        # Or the number of training steps ensures complete alignment for each update.
-        if self.accumulation_steps > 1 and num_batches > 0 and ((self._batch_index + 1) % self.accumulation_steps != 0):
+        # 提前停止发生在累积窗口中间时，提交尚未更新的梯度。
+        if (num_batches > 0
+                and self._batch_index + 1 != self._steps_per_epoch
+                and (self._batch_index + 1) % self.accumulation_steps != 0):
             self._clip_dense_gradients()
             self._optimizer_step()
             self._optimizer_zero_grad()
@@ -843,6 +845,7 @@ class BaseModel(nn.Module):
         return evaluate_metrics(y_true, y_pred, metrics, group_id)
 
     def save_weights(self, checkpoint):
+        os.makedirs(os.path.dirname(os.path.abspath(checkpoint)), exist_ok=True)
         torch.save(self.state_dict(), checkpoint)
 
     def load_weights(self, checkpoint):
