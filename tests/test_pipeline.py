@@ -4,8 +4,9 @@ import os
 from pathlib import Path
 import subprocess
 import sys
-import tempfile
+import shutil
 import unittest
+from uuid import uuid4
 
 import numpy as np
 import pandas as pd
@@ -14,6 +15,9 @@ import yaml
 
 import model_zoo
 from model_zoo.LONGER_RankMixer import LongerEncoder, MaskedMeanReadout
+from unirank.pytorch.layers.interactions.per_token_ffn import PerTokenMoEFFN
+from unirank.pytorch.layers.interactions.token_mix import MultiHeadTokenMixing
+from unirank.pytorch.models.rank_model import Float32Sigmoid
 from unirank.features import FeatureMap
 from unirank.preprocess import FeatureProcessor, build_dataset
 from unirank.pytorch.dataloaders import RankDataLoader
@@ -22,6 +26,10 @@ from unirank.utils import load_config
 
 LABELS = ['is_click', 'is_follow', 'is_like', 'is_comment', 'is_forward', 'long_view']
 ROOT = Path(__file__).resolve().parents[1]
+CASES = [('LONGER', {}), ('RankMixer', {}), ('TokenMixer', {}),
+         ('LONGER_RankMixer', {'rankmixer_num_layers': 0}),
+         ('LONGER_RankMixer', {}),
+         ('LONGER_RankMixer', {'rankmixer_num_experts': 4, 'rankmixer_num_layers': 2})]
 
 
 def make_fixture(root):
@@ -89,9 +97,16 @@ class PipelineTests(unittest.TestCase):
         torch.set_num_threads(1)
 
     def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name)
+        # Normal inherited permissions also work in restricted Windows sandboxes.
+        base = Path(os.environ.get('UNIRANK_TEST_OUTPUT', ROOT / '.test_artifacts')).resolve()
+        base.mkdir(parents=True, exist_ok=True)
+        self.root = base / uuid4().hex
+        self.root.mkdir()
+        def cleanup():
+            if self.root.resolve().parent != base:
+                raise RuntimeError('Refusing cleanup outside test directory')
+            shutil.rmtree(self.root)
+        self.addCleanup(cleanup)
         self.fm, self.data = make_fixture(self.root)
 
     def loaders(self, workers=0):
@@ -138,10 +153,11 @@ class PipelineTests(unittest.TestCase):
         """不足一个累积窗口的梯度也要进入最佳 checkpoint，加载后预测一致。"""
         train, valid, test = self.loaders()
         inputs = next(iter(valid))
-        for name in ('LONGER', 'RankMixer', 'TokenMixer', 'LONGER_RankMixer'):
-            with self.subTest(model=name):
+        for name, overrides in CASES:
+            with self.subTest(model=name, **overrides):
                 torch.manual_seed(2026)
-                model = getattr(model_zoo, name)(self.fm, model_id=name, **model_options(self.root))
+                options = dict(model_options(self.root), **overrides)
+                model = getattr(model_zoo, name)(self.fm, model_id=name, **options)
                 initial = {key: value.clone() for key, value in model.state_dict().items()}
                 updates = []
                 optimizer_step = model._optimizer_step
@@ -162,7 +178,7 @@ class PipelineTests(unittest.TestCase):
                 self.assertEqual(len(logs), 14)
                 model.eval()
                 expected = model(inputs)
-                restored = getattr(model_zoo, name)(self.fm, model_id=name, **model_options(self.root))
+                restored = getattr(model_zoo, name)(self.fm, model_id=name, **options)
                 restored.load_weights(model.checkpoint)
                 restored.eval()
                 for key, value in restored(inputs).items():
@@ -191,20 +207,29 @@ class PipelineTests(unittest.TestCase):
         config = self.root / 'config'
         config.mkdir()
         (config / 'dataset_config.yaml').write_text(yaml.safe_dump({'tiny': self.data}), encoding='utf8')
-        options = dict(model_options(self.root), model='LONGER_RankMixer', dataset_id='tiny',
-                       batch_size=2, num_workers=0, epochs=1, shuffle=False, seed=2026,
-                       enable_bf16=True, note='中文配置')
-        (config / 'model_config.yaml').write_text(yaml.safe_dump({'smoke': options}, allow_unicode=True), encoding='utf8')
-        command = [sys.executable, str(ROOT / 'run_expid.py'), '--config', str(config),
-                   '--expid', 'smoke', '--gpu', '-1', '--no-enable_bf16']
-        run = subprocess.run(command, capture_output=True, text=True, encoding='utf8',
-                             env=dict(os.environ, PYTHONUTF8='1', PYTHONDONTWRITEBYTECODE='1'), timeout=120)
-        self.assertEqual(run.returncode, 0, run.stdout[-2000:] + run.stderr[-2000:])
-        self.assertIn('BF16 mixed precision: False', run.stdout + run.stderr)
-        self.assertTrue((self.root / 'checkpoints/tiny/smoke.model').is_file())
+        experiments = yaml.safe_load((ROOT / 'config/model_config.yaml').read_text(encoding='utf8'))
+        for expid in sorted(experiments.keys() - {'Base'}):
+            with self.subTest(expid=expid):
+                options = load_config(str(ROOT / 'config'), expid)
+                rank_layers = options.get('rankmixer_num_layers', 1)
+                options.update(model_options(self.root))
+                options.update(dataset_id='tiny', batch_size=2, num_workers=0, epochs=1,
+                               shuffle=False, seed=2026, enable_bf16=True, note='中文配置',
+                               rankmixer_num_layers=rank_layers)
+                (config / 'model_config.yaml').write_text(
+                    yaml.safe_dump({expid: options}, allow_unicode=True), encoding='utf8')
+                command = [sys.executable, str(ROOT / 'run_expid.py'), '--config', str(config),
+                           '--expid', expid, '--gpu', '-1', '--no-enable_bf16']
+                run = subprocess.run(command, capture_output=True, text=True, encoding='utf8',
+                    env=dict(os.environ, PYTHONUTF8='1', PYTHONDONTWRITEBYTECODE='1',
+                             OMP_NUM_THREADS='1', MKL_NUM_THREADS='1'), timeout=120)
+                self.assertEqual(run.returncode, 0, run.stdout[-2000:] + run.stderr[-2000:])
+                self.assertIn('BF16 mixed precision: False', run.stdout + run.stderr)
+                self.assertIn('******** Test evaluation ********', run.stdout + run.stderr)
+                self.assertTrue((self.root / f'checkpoints/tiny/{expid}.model').is_file())
 
     def test_all_experiment_configs(self):
-        """五个实际实验配置缩小尺寸后，均可构建模型并完成反向传播。"""
+        """实际实验配置缩小尺寸后，均可构建模型并完成反向传播。"""
         experiments = yaml.safe_load((ROOT / 'config/model_config.yaml').read_text(encoding='utf8'))
         inputs = next(iter(self.loaders()[0]))
         for experiment in experiments.keys() - {'Base'}:
@@ -216,7 +241,7 @@ class PipelineTests(unittest.TestCase):
                 options['rankmixer_num_layers'] = rank_layers
                 model = getattr(model_zoo, options['model'])(self.fm, **options)
                 outputs = model(inputs)
-                self.assertEqual(len(outputs), 6)
+                self.assertTrue(all(f'{label}_pred' in outputs for label in LABELS))
                 loss = model.compute_loss(outputs, model.get_labels(inputs))
                 self.assertTrue(torch.isfinite(loss))
                 loss.backward()
@@ -225,15 +250,85 @@ class PipelineTests(unittest.TestCase):
     def test_cuda_bf16_and_activation_checkpointing(self):
         """在实际 GPU 上检查 BF16 与激活重算的前向、反向和优化器更新。"""
         train, valid, _ = self.loaders()
-        for name in ('LONGER', 'RankMixer', 'TokenMixer', 'LONGER_RankMixer'):
-            with self.subTest(model=name):
-                options = dict(model_options(self.root), gpu=0, enable_bf16=True,
+        for name, overrides in CASES:
+            with self.subTest(model=name, **overrides):
+                options = dict(model_options(self.root), **overrides)
+                options.update(gpu=0, enable_bf16=True,
                                gradient_checkpointing=True)
                 model = getattr(model_zoo, name)(self.fm, model_id=name, **options)
                 model.fit(train, epochs=1, validation_data=valid)
                 self.assertTrue(all(np.isfinite(value) for value in model.evaluate(valid).values()))
                 del model
         torch.cuda.empty_cache()
+
+    def test_moe_dual_route_loss_and_gradients(self):
+        inputs = next(iter(self.loaders()[0]))
+        model = model_zoo.LONGER_RankMixer(self.fm, **dict(model_options(self.root),
+            rankmixer_num_experts=4, rankmixer_num_layers=2))
+        model.train()
+        outputs = model(inputs)
+        self.assertEqual(len(outputs), 13)
+        labels = model.get_labels(inputs)
+        infer_loss = sum(torch.nn.functional.binary_cross_entropy(outputs[f'{k}_pred'], v)
+                         for k, v in zip(LABELS, labels))
+        train_loss = sum(torch.nn.functional.binary_cross_entropy(outputs[f'{k}_train_pred'], v)
+                         for k, v in zip(LABELS, labels))
+        loss = model.compute_loss(outputs, labels)
+        torch.testing.assert_close(loss, .5 * (infer_loss + train_loss) + outputs['moe_reg_loss'])
+        loss.backward()
+        for name, parameter in model.named_parameters():
+            self.assertIsNotNone(parameter.grad, name)
+            self.assertTrue(torch.isfinite(parameter.grad).all(), name)
+        for ffn in model.rankmixer.pffn_layers:
+            self.assertGreater(ffn.router_train.weight.grad.abs().sum().item(), 0)
+            self.assertGreater(ffn.router_infer.router.weight.grad.abs().sum().item(), 0)
+        model.eval()
+        self.assertEqual(set(model(inputs)), {f'{k}_pred' for k in LABELS})
+
+    def test_moe_regularizer_only_updates_infer_router(self):
+        ffn = PerTokenMoEFFN(2, 8, num_experts=4)
+        # Positive logits make the expected L1 gradient unambiguous.
+        with torch.no_grad():
+            ffn.router_infer.router.weight.zero_()
+            ffn.router_infer.router.bias.fill_(1)
+        x = torch.randn(3, 2, 8, requires_grad=True)
+        _, reg = ffn(x)
+        reg.backward()
+        self.assertIsNone(x.grad)
+        self.assertIsNone(ffn.W1.grad)
+        self.assertIsNone(ffn.router_train.weight.grad)
+        self.assertGreater(ffn.router_infer.router.bias.grad.abs().sum().item(), 0)
+        ffn.eval()
+        self.assertEqual(ffn(x)[1].item(), 0)
+        self.assertEqual(ffn(x, route='train')[1].item(), 0)
+        with self.assertRaises(ValueError):
+            ffn(x, route='typo')
+        with self.assertRaises(ValueError):
+            ffn(x[:, :1])
+
+    def test_bf16_probability_keeps_confident_wrong_gradient(self):
+        logits = torch.tensor([6.25], dtype=torch.bfloat16, requires_grad=True)
+        probability = Float32Sigmoid()(logits)
+        self.assertEqual(probability.dtype, torch.float32)
+        self.assertLess(probability.item(), 1)
+        loss = torch.nn.functional.binary_cross_entropy(probability, torch.zeros(1))
+        loss.backward()
+        self.assertGreater(logits.grad.item(), .9)
+
+    def test_token_mixing_keeps_every_coordinate(self):
+        for tokens, dim in [(3, 8), (4, 8)]:
+            x = torch.arange(tokens * dim, dtype=torch.float32).reshape(1, tokens, dim)
+            mixed = MultiHeadTokenMixing(dim, tokens)(x)
+            self.assertEqual(mixed.shape, x.shape)
+            torch.testing.assert_close(mixed.flatten().sort().values, x.flatten())
+
+    def test_encoder_rejects_invalid_windows(self):
+        with self.assertRaises(ValueError):
+            LongerEncoder(8, 4, max_len=8, num_groups=2, query_size=5)
+        encoder = LongerEncoder(8, 4, token_dim=8, max_len=8, num_groups=2,
+                                query_size=2, num_global_tokens=2)
+        with self.assertRaises(ValueError):
+            encoder(torch.randn(2, 10, 8), torch.randn(2, 12), torch.ones(2, 10))
 
 
 if __name__ == '__main__':

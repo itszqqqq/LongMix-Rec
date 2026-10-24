@@ -114,8 +114,7 @@ TokenMixer_KuaiRand_Video_Action: # This is a config template
     accumulation_steps: 1
 
 
-# LONGER 历史建模 + 可选的 dense RankMixer 特征交互。
-
+# LONGER 历史建模 + RankMixer 特征交互。
 LONGER_RankMixer_NoMixer_KuaiRand_Video_Action: &longer_readout_base
     model: LONGER_RankMixer
     dataset_id: KuaiRand_Video_Action
@@ -131,11 +130,11 @@ LONGER_RankMixer_NoMixer_KuaiRand_Video_Action: &longer_readout_base
     num_groups: 4
     query_size: 10
     num_global_tokens: 4
-    num_rank_tokens: 8
+    num_rank_tokens: 8   # 将拼接特征转换成多少个 token
     num_heads: 2
     longer_num_layers: 1
     longer_expansion_factor: 4
-    rankmixer_num_layers: 0
+    rankmixer_num_layers: 0   # RankMixer 交互层的数量
     rankmixer_expansion_factor: 2
     dnn_activations: ReLU
     tower_hidden_units: [128, 64]
@@ -149,6 +148,13 @@ LONGER_RankMixer_NoMixer_KuaiRand_Video_Action: &longer_readout_base
     enable_torch_compile: false
     gradient_checkpointing: false
 
-LONGER_RankMixer_KuaiRand_Video_Action:
+LONGER_RankMixer_Dense_KuaiRand_Video_Action:
     <<: *longer_readout_base
     rankmixer_num_layers: 1
+    rankmixer_num_experts: 0
+
+LONGER_RankMixer_KuaiRand_Video_Action:
+    <<: *longer_readout_base
+    rankmixer_num_layers: 1    # RankMixer 交互层的数量
+    rankmixer_num_experts: 4  # 每个 token 有 4 个专家，train 和 infer 路由共享专家参数。
+    rankmixer_l1_lambda: 0.01  # 仅用于 infer 路由的稀疏正则，在模型总损失中计入一次。

@@ -2,7 +2,7 @@
 """Full LONGER output -> masked mean -> feature concat -> Chunk -> RankMixer.
 
 Reuses the mask/causal-corrected LONGERBlock in the UniRank checkout.
-Both stages are trained end to end by the inherited multi-task loss.
+Both stages are trained end to end; MoE uses joint dual-route task losses.
 """
 
 import torch
@@ -33,6 +33,16 @@ class LongerEncoder(nn.Module):
         dnn_activations="ReLU",
     ):
         super().__init__()
+
+        # Fail before allocating position parameters for invalid configurations.
+        if max_len <= 0 or num_groups <= 0 or max_len % num_groups:
+            raise ValueError("max_len must be positive and divisible by num_groups > 0")
+        if not 1 <= query_size <= max_len // num_groups:
+            raise ValueError("query_size must be in [1, max_len // num_groups]")
+        if num_layers < 1 or num_global_tokens < 1:
+            raise ValueError("num_layers and num_global_tokens must be positive")
+        if num_heads < 1 or token_dim % num_heads:
+            raise ValueError("token_dim must be divisible by num_heads > 0")
 
         self.item_info_dim = item_info_dim
         self.context_target_dim = non_item_dim + item_info_dim
@@ -74,7 +84,18 @@ class LongerEncoder(nn.Module):
         )
 
     def forward(self, history_emb, context_target_emb, history_mask):
+        if history_emb.ndim != 3 or history_emb.size(-1) != self.item_info_dim:
+            raise ValueError("history_emb must have shape [B, L, item_info_dim]")
         batch_size, length, _ = history_emb.shape  # shape:(B, seq_len, item_info_dim)
+
+        if not 0 < length <= self.max_len or length % self.num_groups:
+            raise ValueError("history length must be positive, <= max_len and divisible by num_groups")
+        if self.query_size > length // self.num_groups:
+            raise ValueError("query_size exceeds merged history length")
+        if history_mask.shape != history_emb.shape[:2]:
+            raise ValueError("history_mask must have shape [B, L]")
+        if context_target_emb.shape != (batch_size, self.context_target_dim):
+            raise ValueError("context_target_emb must have shape [B, context_target_dim]")
 
         history_mask = history_mask.to(device=history_emb.device, dtype=torch.bool)
         positions = self.history_position_embedding[-length:].unsqueeze(0)
@@ -132,12 +153,14 @@ class LONGER_RankMixer(MultiTaskModel):
         num_groups=4,
         query_size=10,
         num_global_tokens=4,
-        num_rank_tokens=8,
+        num_rank_tokens=8,    # 切分 token 的数量
         num_heads=2,
         longer_num_layers=1,
         longer_expansion_factor=4,
         rankmixer_num_layers=1,
         rankmixer_expansion_factor=2,
+        rankmixer_num_experts=0,  # 0 使用普通 FFN；正数表示启用 MoE 时每个 token 的专家数量。
+        rankmixer_l1_lambda=0.01,  # 传给各层 MoE 的推理路由稀疏正则系数。
         dnn_activations="ReLU",
         tower_hidden_units=(128, 64),
         tower_activations="ReLU",
@@ -157,6 +180,8 @@ class LONGER_RankMixer(MultiTaskModel):
         self.num_global_tokens = num_global_tokens
         self.num_rank_tokens = num_rank_tokens
         self.accumulation_steps = accumulation_steps
+        # 只有启用 RankMixer 层且专家数量为正时，才执行 MoE 双路训练。
+        self.use_moe = rankmixer_num_layers > 0 and rankmixer_num_experts > 0
         self.item_info_dim = 0
         self.non_item_dim = 0
 
@@ -198,8 +223,10 @@ class LONGER_RankMixer(MultiTaskModel):
                 input_dim=token_dim,
                 num_ns_token=num_rank_tokens,
                 num_layers=rankmixer_num_layers,
-                expand=rankmixer_expansion_factor,
+                ffn_expansion=rankmixer_expansion_factor,
                 net_dropout=net_dropout,
+                num_experts=rankmixer_num_experts,
+                l1_lambda=rankmixer_l1_lambda,
             ) if rankmixer_num_layers > 0 else nn.Identity()
         )
         self.tower = nn.ModuleList([
@@ -241,10 +268,41 @@ class LONGER_RankMixer(MultiTaskModel):
         features = torch.cat([user_context_emb, target_emb, h_long], dim=-1)
         tokens = self.rank_tokenizer(features)  # [B,T_rank,D], all fixed valid slots.
 
+        # 默认执行 infer 路由；训练、验证和推理均使用该路径生成标准预测。
         mixed = self.activation_checkpoint(self.rankmixer, tokens)
+        if self.use_moe:
+            # MoE 返回特征和正则；普通 FFN 与 NoMixer 只返回特征张量。
+            mixed, reg_loss = mixed
         bottom = mixed.mean(dim=1)
 
-        return {
+        # 标准预测键始终对应推理路由，验证和早停直接复用原训练框架。
+        return_dict = {
             f"{label}_pred": self.output_activation[i](self.tower[i](bottom))
             for i, label in enumerate(self.feature_map.labels)
         }
+
+        if self.training and self.use_moe:
+            # 复用 LONGER 和分词器的输出，从相同初始 tokens 执行完整的 train 路径。
+            # 两条路径共享模块参数，但各自逐层计算自己的中间表示。
+            mixed_train, _ = self.activation_checkpoint(self.rankmixer, tokens, "train")
+            bottom_train = mixed_train.mean(dim=1)
+            # 两条路径共用预测塔，分别得到每个任务的预测概率。
+            for i, label in enumerate(self.feature_map.labels):
+                return_dict[f"{label}_train_pred"] = self.output_activation[i](self.tower[i](bottom_train))
+            # 将正则随前向结果返回，由 compute_loss 加入总损失。
+            return_dict["moe_reg_loss"] = reg_loss
+        return return_dict
+
+    def compute_loss(self, return_dict, y_true):
+        # 复用父类的多任务损失；MoE 模式下标准预测来自 infer 路由。
+        loss = super().compute_loss(return_dict, y_true)
+        if self.training and self.use_moe:
+            # 将 train 路径的预测映射到父类要求的键名，复用同一套任务损失。
+            train_predictions = {
+                f"{label}_pred": return_dict[f"{label}_train_pred"]
+                for label in self.feature_map.labels
+            }
+            train_loss = super().compute_loss(train_predictions, y_true)
+            # 两路任务损失等权平均；正则已乘系数，此处只加一次。
+            loss = 0.5 * (loss + train_loss) + return_dict["moe_reg_loss"]
+        return loss

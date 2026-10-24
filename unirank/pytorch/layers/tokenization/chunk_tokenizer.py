@@ -33,7 +33,7 @@ class ChunkTokenizer(nn.Module):
         self.num_tokens = num_tokens  # tokenizer 输出 token 的数量
         self.chunk_dim = int(math.ceil(float(input_dim) / float(num_tokens)))  # 每个 chunk 的维度
         self.padded_input_dim = self.chunk_dim * num_tokens  # 填充后的输入维度
-        self.pad_dim = self.padded_input_dim - input_dim  # 需要补 padding 的数量
+        self.pad_dim = self.padded_input_dim - input_dim  # 需要补 padding 的数量；padding 到 chunk_size 的整数倍
         self.token_mlps = nn.ModuleList([
             MLP_Block(
                 input_dim=self.chunk_dim,

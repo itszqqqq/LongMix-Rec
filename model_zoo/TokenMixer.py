@@ -182,24 +182,24 @@ class TokenMixerBlocks(nn.Module):
         ])
 
         self.mixer_layers = nn.ModuleList([
-            MultiHeadTokenMixing(input_dim=self.block_dim, num_token=num_tokens)
+            MultiHeadTokenMixing(input_dim=self.block_dim, num_tokens=num_tokens)
             for _ in range(num_layers)
         ])
         self.revert_layers = nn.ModuleList([
-            MultiHeadTokenMixing(input_dim=self.block_dim, num_token=num_tokens)
+            MultiHeadTokenMixing(input_dim=self.block_dim, num_tokens=num_tokens)
             for _ in range(num_layers)
         ])
         self.pffn_layers1 = nn.ModuleList([
             PerTokenSwiGLU(input_dim=self.block_dim,
-                           num_token=num_tokens,
-                           expand=expand,
+                           num_tokens=num_tokens,
+                           ffn_expansion=expand,
                            net_dropout=net_dropout)
             for _ in range(num_layers)
         ])
         self.pffn_layers2 = nn.ModuleList([
             PerTokenSwiGLU(input_dim=self.block_dim,
-                                num_token=num_tokens,
-                                expand=expand,
+                                num_tokens=num_tokens,
+                                ffn_expansion=expand,
                                 net_dropout=net_dropout)
             for _ in range(num_layers)
         ])

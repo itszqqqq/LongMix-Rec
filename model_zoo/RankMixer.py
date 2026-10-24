@@ -19,6 +19,7 @@ from torch import nn
 import torch.nn.functional as F
 from unirank.pytorch.models import MultiTaskModel
 from unirank.pytorch.layers import FeatureEmbedding, MLP_Block, MultiHeadTargetAttention, PerTokenFeedForward, MultiHeadTokenMixing
+from unirank.pytorch.layers.interactions.per_token_ffn import PerTokenMoEFFN
 from unirank.pytorch.torch_utils import get_activation
 from unirank.utils import not_in_whitelist
 from unirank.pytorch.layers.tokenization import build_unified_tokenizer
@@ -102,7 +103,7 @@ class RankMixer(MultiTaskModel):
         self.unified_interaction_layers = RankMixerBlock(input_dim=token_dim,
                                          num_ns_token=self.num_ns_token,
                                          num_layers=num_layers,
-                                         expand=expansion_factor,
+                                         ffn_expansion=expansion_factor,
                                          net_dropout=net_dropout)
 
         self.tower = nn.ModuleList([MLP_Block(input_dim=token_dim,
@@ -170,10 +171,17 @@ class RankMixerBlock(nn.Module):
                  input_dim,
                  num_ns_token,
                  num_layers,
-                 expand=2,
-                 net_dropout=0.0):
+                 ffn_expansion=2,
+                 net_dropout=0.0,
+                 num_experts=0,  # 0 表示普通 Per-token FFN；正数表示每个 token 的专家数量。
+                 l1_lambda=0.01):  # 推理路由的 L1 稀疏正则系数。
         super(RankMixerBlock, self).__init__()
+        if num_layers < 0 or (num_experts > 0 and num_layers == 0):
+            raise ValueError("MoE requires num_layers > 0; dense num_layers must be nonnegative")
+        if num_experts < 0:
+            raise ValueError("num_experts must be nonnegative")
         self.num_layers = num_layers   
+        self.use_moe = num_experts > 0
 
         self.mixer_norms = nn.ModuleList([
             nn.LayerNorm(input_dim)
@@ -186,22 +194,41 @@ class RankMixerBlock(nn.Module):
 
         # Multi-head Token Mixing
         self.mixer_layers = nn.ModuleList([
-            MultiHeadTokenMixing(input_dim=input_dim, num_token=num_ns_token)
+            MultiHeadTokenMixing(input_dim=input_dim, num_tokens=num_ns_token)
             for _ in range(num_layers)
         ])
 
+        # 每层只创建一组专家参数，训练路由和推理路由共用这一组专家。
         self.pffn_layers = nn.ModuleList([
             PerTokenFeedForward(input_dim=input_dim,
-                           num_token=num_ns_token,
-                           expand=expand,
+                           num_tokens=num_ns_token,
+                           ffn_expansion=ffn_expansion,
                            net_dropout=net_dropout)
+            if not self.use_moe else
+            PerTokenMoEFFN(input_dim=input_dim,
+                          num_tokens=num_ns_token,
+                          num_experts=num_experts,
+                          ffn_expansion=ffn_expansion,
+                          l1_lambda=l1_lambda,
+                          net_dropout=net_dropout)
             for _ in range(num_layers)
         ])
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, route="infer"):
+        # 每次调用独立计算一条完整路径；route 指定各层使用哪个路由器。
+        reg_loss = x.new_zeros((), dtype=torch.float32)
         for i in range(self.num_layers):
             x = self.mixer_layers[i](self.mixer_norms[i](x)) + x
-            x = self.pffn_layers[i](self.pffn_norms[i](x)) + x
-            
+            if self.use_moe:
+                ffn_output, layer_reg = self.pffn_layers[i](self.pffn_norms[i](x), route)
+                x = ffn_output + x
+                # layer_reg 已乘正则系数；训练路由和 eval 模式均返回零正则。
+                reg_loss = reg_loss + layer_reg
+            else:
+                x = self.pffn_layers[i](self.pffn_norms[i](x)) + x
+
+        if self.use_moe:
+            # 对各层正则取平均，避免正则尺度随层数增加。
+            return x, reg_loss / self.num_layers
         return x
 

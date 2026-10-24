@@ -38,6 +38,14 @@ try:
 except Exception:
     Join = None
 
+class Float32Sigmoid(nn.Module):
+    """Keep probability precision before BCE, including under BF16 autocast."""
+
+    def forward(self, logits):
+        # Casting probabilities after a BF16 sigmoid cannot undo rounding to 1.
+        return torch.sigmoid(logits.float())
+
+
 class BaseModel(nn.Module):
     def __init__(self,
                  feature_map,
@@ -862,7 +870,7 @@ class BaseModel(nn.Module):
 
     def get_output_activation(self, task):
         if task == "binary_classification":
-            return nn.Sigmoid()
+            return Float32Sigmoid()
         elif task == "regression":
             return nn.Identity()
         else:

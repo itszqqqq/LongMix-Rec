@@ -74,6 +74,19 @@ class LONGER(MultiTaskModel):
                  accumulation_steps=1,    # 训练时梯度累积次数
                  max_len=100,
                  **kwargs):
+        # Validate configuration before creating embeddings and prediction towers.
+        if max_len <= 0 or num_groups <= 0:
+            raise ValueError("[LONGER] max_len and num_groups must be positive.")
+        if max_len % num_groups != 0:
+            raise ValueError(
+                f"[LONGER] max_len={max_len} must be divisible by num_groups={num_groups}."
+            )
+        if not 1 <= query_size <= max_len // num_groups:
+            raise ValueError(
+                f"[LONGER] query_size={query_size} must be in "
+                f"[1, {max_len // num_groups}] for max_len={max_len}, num_groups={num_groups}."
+            )
+
         super(LONGER, self).__init__(feature_map,
                                      model_id=model_id,
                                      gpu=gpu,
@@ -165,6 +178,10 @@ class LONGER(MultiTaskModel):
 
         # s_tokens = self.item_token_proj(sequence_emb)
         length = sequence_emb.size(1)
+        if not 0 < length <= self.max_len:
+            raise ValueError(
+                f"[LONGER] history length={length} must be in [1, {self.max_len}]."
+            )
 
         # 位置编码。与左 padding 对齐：短窗口使用位置表的末尾，最新行为固定在最后位置。
         positions = self.history_position_embedding[-length:].unsqueeze(0)
@@ -204,6 +221,8 @@ class LONGERBlock(nn.Module):
                  dnn_activations='ReLU',
                  expansion_factor=4):
         super(LONGERBlock, self).__init__()
+        if num_groups <= 0 or query_size <= 0:
+            raise ValueError("[LONGER] num_groups and query_size must be positive.")
         self.num_layers = num_layers
         self.query_size = query_size
 
@@ -242,9 +261,23 @@ class LONGERBlock(nn.Module):
         ns_tokens: B x Lns x D
         mask: B x Ls
         """
+        if s_tokens.ndim != 3:
+            raise ValueError("[LONGER] history tokens must have shape [B, L, D].")
         length = s_tokens.size(1)
         group_size = self.inner_trans.num_groups
+        if length <= 0 or length % group_size != 0:
+            raise ValueError(
+                f"[LONGER] history length={length} must be positive and "
+                f"divisible by num_groups={group_size}."
+            )
         merged_length = length // group_size
+        if not 1 <= self.query_size <= merged_length:
+            raise ValueError(
+                f"[LONGER] query_size={self.query_size} must be in "
+                f"[1, {merged_length}] for history length={length}, num_groups={group_size}."
+            )
+        if mask is not None and mask.shape != s_tokens.shape[:2]:
+            raise ValueError("[LONGER] history mask must match tokens [B, L].")
 
         # [修改 1] 原始 history mask -> merged mask -> query/key mask。
         if mask is None:
@@ -297,6 +330,8 @@ class LONGERBlock(nn.Module):
 class InnerTrans(nn.Module):
     def __init__(self, input_dim, num_groups=4, expansion_factor=4, dnn_activations='ReLU'):
         super(InnerTrans, self).__init__()
+        if num_groups <= 0:
+            raise ValueError("[LONGER] num_groups must be positive.")
         self.input_dim = input_dim
         self.num_groups = num_groups
 
@@ -313,13 +348,18 @@ class InnerTrans(nn.Module):
             nn.Linear(hidden_dim * expansion_factor, input_dim)  # 这里把合并 token 压回了 D 维
         )
 
-    def forward(self, s_tokens, mask=None):  # [修改 1] 接收组内 padding mask。
+    def forward(self, s_tokens, mask=None):
         """
         s_tokens: B x Ls x D
         return:
             merge_s_tokens: B x Lms x D
         """
         B, Ls, D = s_tokens.shape   
+        if Ls <= 0 or Ls % self.num_groups != 0:
+            raise ValueError(
+                f"[LONGER] history length={Ls} must be positive and "
+                f"divisible by num_groups={self.num_groups}."
+            )
 
         Lms = Ls // self.num_groups  
         if mask is None:
@@ -372,7 +412,7 @@ class CrossCausalAttention(nn.Module):
         )
 
     def forward(self, q_tokens, kv_tokens, query_mask=None, key_mask=None,
-                causal_mask=None):  # [修改 1/2] padding 与组级因果约束。
+                causal_mask=None):
         """
         q_tokens: B x (Lq + Lns) x D
         kv_tokens: B x (Lms + Lns) x D
@@ -423,7 +463,7 @@ class SelfCausalAttention(nn.Module):
             nn.Linear(input_dim * expansion_factor, input_dim)
         )
 
-    def forward(self, tokens, mask=None):  # [修改 1] padding mask 与原下三角约束合并。
+    def forward(self, tokens, mask=None):
         """
         tokens: B x (Lq + Lns) x D
         """
